@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# never commit credentials or captured traffic
+.env
+*.env
+auth.json
+credentials.json
+*.pem
+*.bin
+*.flow
+*.har
+bench-*.log

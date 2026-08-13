@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cursor2api"
+version = "0.1.0"
+description = "Anthropic Messages and OpenAI Chat Completions APIs in front of Cursor's agent protocol"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["h2>=4.1.0,<5"]
+
+[project.scripts]
+cursor2api = "cursor2api.__main__:main"
+
+[tool.setuptools]
+packages = ["cursor2api"]
