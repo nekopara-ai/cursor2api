@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import auth as auth_mod
 from . import h2stream, models, openai_api
 from .auth import AuthError
-from .session import HOST, Session
+from .session import HOST, Session, split_client_type
 
 BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8787"))
@@ -48,6 +48,73 @@ WEB = os.environ.get("CURSOR2API_WEB", "1") == "1"
 THINKING = os.environ.get("CURSOR2API_THINKING", "auto")
 PING = float(os.environ.get("PING_INTERVAL", "5"))   # SSE keepalive while upstream is quiet
 DEBUG = bool(os.environ.get("DBG"))
+
+# ---- live tool-call sessions ------------------------------------------------
+# A turn that stops at tool_use leaves the Run stream open waiting for the
+# result. Instead of closing it and replaying the whole history as text on the
+# next request (which the model sometimes distrusts and re-runs), the session is
+# parked here keyed by tool_use id; a follow-up request whose last user message
+# is purely the matching tool_result(s) resumes the same live stream.
+LIVE_TTL = float(os.environ.get("CURSOR2API_LIVE_TTL", "150"))
+_live_sessions = {}      # tool_use_id -> {session, exec: (eid, esid), ts, model}
+_live_lock = threading.Lock()
+
+
+def _live_gc_locked():
+    now = time.time()
+    for key in [k for k, v in _live_sessions.items() if now - v["ts"] > LIVE_TTL]:
+        entry = _live_sessions.pop(key)
+        if not any(v["session"] is entry["session"] for v in _live_sessions.values()):
+            try:
+                entry["session"].close()
+            except Exception:
+                pass
+
+
+def register_live(turn):
+    """Park the open session after a tool_use turn. True when parked."""
+    if turn.stop_reason != "tool_use" or not turn.pending or turn.session is None:
+        return False
+    with _live_lock:
+        _live_gc_locked()
+        for tu in turn.pending:
+            eid, esid = tu.get("exec") or (None, None)
+            _live_sessions[tu["id"]] = {"session": turn.session,
+                                        "exec": (eid, esid),
+                                        "ts": time.time(),
+                                        "model": turn.model,
+                                        "client_type": turn.client_type}
+    return True
+
+
+def claim_live(body, model, client_type):
+    """[(entry, tool_result_block)] when the request purely answers a parked
+    session's tool calls, else None. A parked stream keeps the usage pool it was
+    opened against, so it may only be resumed by a request of the same identity."""
+    messages = body.get("messages") or []
+    if not messages or messages[-1].get("role") != "user":
+        return None
+    blocks = messages[-1].get("content")
+    if not isinstance(blocks, list) or not blocks:
+        return None
+    if any(not (isinstance(b, dict) and b.get("type") == "tool_result") for b in blocks):
+        return None
+    with _live_lock:
+        _live_gc_locked()
+        session = None
+        claimed = []
+        for b in blocks:
+            entry = _live_sessions.get(b.get("tool_use_id"))
+            if entry is None or entry["model"] != model or \
+                    entry.get("client_type") != client_type or \
+                    (session is not None and entry["session"] is not session):
+                return None
+            session = entry["session"]
+            claimed.append((entry, b))
+        for b in blocks:
+            _live_sessions.pop(b.get("tool_use_id"), None)
+    return claimed
+
 
 # Plain chat has no workspace and no caller tools, but Cursor still hands the model
 # its coding-agent harness. This keeps answers from turning into repository work.
@@ -169,7 +236,7 @@ class Turn:
 
     def __init__(self, body):
         self.body = body
-        self.model_in = body.get("model", DEFAULT_MODEL)
+        self.client_type, self.model_in = split_client_type(body.get("model", DEFAULT_MODEL))
         self.model, self.model_params = models.resolve(self.model_in, DEFAULT_MODEL)
         self.tools = tool_specs(body.get("tools"))
         self.want_thinking = bool((body.get("thinking") or {}).get("type") == "enabled")
@@ -185,6 +252,8 @@ class Turn:
         self.stop_reason = None
         self.stop_sequence = None
         self.text_so_far = ""
+        self.sent_chars = 0        # chars actually sent upstream, for usage estimates
+        self.think_chars = 0       # thinking chars received, for usage estimates
 
     def _tune(self, images, docs):
         """Drop reasoning for turns that did not ask for it (time to first token)."""
@@ -214,14 +283,36 @@ class Turn:
                 "instead of describing it. Your builtin file, search and shell tools "
                 "are not connected to this machine and will fail; use only the "
                 "provided tools, and use the paths given in the conversation rather "
-                "than the workspace path you were told about.")
+                "than the workspace path you were told about. Earlier turns may "
+                "appear as a transcript in which `[called tool NAME with ARGS]` "
+                "followed by `[tool result: ...]` records a tool call that really "
+                "executed on the user's machine; treat those results as real and "
+                "current, and do not call a tool again merely to re-verify them.")
         self._tune(images, docs)
         if self.chat:
             sysmsg = ((sysmsg + "\n\n") if sysmsg else "") + CHAT_PROMPT
+        self.sent_chars = (len(prompt) + len(sysmsg or "")
+                           + (len(json.dumps(self.tools, ensure_ascii=False)) if self.tools else 0))
         self.session = Session(model=self.model, system=sysmsg, tools=self.tools,
                                web=WEB, model_params=self.model_params, debug=DEBUG,
-                               chat=self.chat)
+                               chat=self.chat, client_type=self.client_type)
         self.session.start(prompt, images=images, documents=docs)
+
+    def resume(self, claimed):
+        """Continue a parked live session by answering its tool calls."""
+        self.session = claimed[0][0]["session"]
+        results = []
+        chars = 0
+        for entry, block in claimed:
+            eid, esid = entry["exec"]
+            content = block.get("content")
+            text = content if isinstance(content, str) else " ".join(
+                x.get("text", "") for x in (content or [])
+                if isinstance(x, dict) and x.get("type") == "text")
+            chars += len(text)
+            results.append((eid, esid, text, bool(block.get("is_error"))))
+        self.sent_chars = max(1, chars)
+        self.session.send_tool_results(results)
 
     def stream(self):
         """Yields ('thinking'|'text'|'tool_use'|'done'|'error', value)."""
@@ -237,6 +328,7 @@ class Turn:
                     self.stop_reason = reason
                     break
             elif kind == "thinking":
+                self.think_chars += len(val)
                 if self.want_thinking:
                     yield "thinking", val
             elif kind == "web":
@@ -316,11 +408,23 @@ def upstream_error(msg):
 
 
 def usage_of(turn):
-    """Anthropic usage, including the cache counters Cursor reports on turn end."""
+    """Anthropic usage, including the cache counters Cursor reports on turn end.
+
+    Cursor only reports real counters in the turn_ended frame, which never
+    arrives for turns that stop at a tool_use (control goes back to the API
+    caller while Cursor's turn stays open). Those turns used to report
+    input_tokens=0, which broke accounting downstream (LiteLLM spend logs saw
+    0 prompt tokens on nearly every agent request). Estimate missing sides at
+    ~4 chars/token from what was actually sent and received instead.
+    """
     u = {"input_tokens": turn.usage.get("input_tokens", 0),
          "output_tokens": turn.usage.get("output_tokens", 0)}
+    if not u["input_tokens"]:                   # no turn_ended: estimate
+        u["input_tokens"] = max(1, turn.sent_chars // 4)
     if not u["output_tokens"]:                  # turn cut short: estimate
-        u["output_tokens"] = max(1, len(turn.text_so_far) // 4)
+        out_chars = (len(turn.text_so_far) + turn.think_chars
+                     + sum(len(json.dumps(tu, ensure_ascii=False)) for tu in turn.pending))
+        u["output_tokens"] = max(1, out_chars // 4)
     for k in ("cache_read_input_tokens", "cache_creation_input_tokens"):
         u[k] = turn.usage.get(k, 0)
     return u
@@ -429,6 +533,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(400, "invalid_request_error", "messages: required")
 
         turn = Turn(body)
+        claimed = None
+        try:
+            claimed = claim_live(body, turn.model, turn.client_type)
+            if claimed:
+                turn.resume(claimed)
+        except Exception:                          # dead stream: fresh replay
+            if claimed:
+                try:
+                    claimed[0][0]["session"].close()
+                except Exception:
+                    pass
+            turn.session = None
         try:
             if openai:
                 turn.model_in = model_in
@@ -453,11 +569,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         finally:
-            turn.close()
+            if not register_live(turn):
+                turn.close()
 
     # -- non-streaming
     def _buffer_turn(self, turn):
-        turn.start()
+        if turn.session is None:
+            turn.start()
         blocks, think, text, web = [], [], [], []
         err = None
         for kind, val in turn.stream():
@@ -504,9 +622,10 @@ class Handler(BaseHTTPRequestHandler):
         chunk(sse("message_start", {"type": "message_start", "message": {
             "id": mid, "type": "message", "role": "assistant", "model": turn.model_in,
             "content": [], "stop_reason": None, "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0}}}))
+                "usage": {"input_tokens": 0, "output_tokens": 0}}}))
 
-        turn.start()
+        if turn.session is None:
+            turn.start()
         idx = -1
         open_kind = None
 
@@ -577,7 +696,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- OpenAI chat completions
     def _buffer_turn_openai(self, turn):
-        turn.start()
+        if turn.session is None:
+            turn.start()
         think, text = [], []
         err = None
         for kind, val in turn.stream():
@@ -611,7 +731,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         send(openai_api.chunk(cid, turn.model_in, {"role": "assistant", "content": ""}))
-        turn.start()
+        if turn.session is None:
+            turn.start()
         calls = 0
         last_ping = time.time()
         for kind, val in turn.stream():

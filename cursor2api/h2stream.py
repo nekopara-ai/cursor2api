@@ -16,12 +16,38 @@ _pool_lock = threading.Lock()
 _filling = set()
 
 
+
+def _open_socket(host, port):
+    import base64
+    from urllib.parse import urlsplit
+    proxy = (os.environ.get("CURSOR2API_PROXY") or os.environ.get("https_proxy")
+             or os.environ.get("HTTPS_PROXY"))
+    if not proxy:
+        return socket.create_connection((host, port), timeout=30)
+    u = urlsplit(proxy if "://" in proxy else "http://" + proxy)
+    raw = socket.create_connection((u.hostname, u.port or 8080), timeout=30)
+    auth = ""
+    if u.username:
+        cred = base64.b64encode(f"{u.username}:{u.password or ''}".encode()).decode()
+        auth = f"Proxy-Authorization: Basic {cred}\r\n"
+    raw.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n".encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = raw.recv(4096)
+        if not chunk:
+            break
+        resp += chunk
+    code = int(resp.split(b" ", 2)[1])
+    assert 200 <= code < 300, f"CONNECT {host}:{port} via proxy failed: {resp[:120]!r}"
+    return raw
+
 class BidiH2:
     def __init__(self, host, port=443):
         self.host=host
         ctx=ssl.create_default_context()
         ctx.set_alpn_protocols(["h2"])
-        raw=socket.create_connection((host,port), timeout=30)
+        # Optional HTTP CONNECT when CURSOR2API_PROXY / https_proxy is set.
+        raw=_open_socket(host, port)
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock=ctx.wrap_socket(raw, server_hostname=host)
         assert self.sock.selected_alpn_protocol()=="h2", "no h2 ALPN"

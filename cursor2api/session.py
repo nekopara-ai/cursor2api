@@ -32,6 +32,27 @@ from . import h2stream
 HOST = "agentn.global.api5.cursor.sh"
 PATH = "/agent.v1.AgentService/Run"
 VERSION = os.environ.get("CURSOR_CLI_VERSION", "cli-2026.08.11-e8db854")
+
+# Cursor picks the usage pool from the announced client identity, not from the
+# model or the endpoint. "cli" draws on the plan's included/bonus pools; "sand"
+# is Grok Bot (bundle id com.anysphere.sand), whose weekly pool is billed apart
+# from the plan and is reported by DashboardService/GetSandUsageStatus.
+# The version header still has to name the CLI build, because that is the
+# transport this stream speaks; a sand version here is rejected outright.
+CLIENT_TYPE = os.environ.get("CURSOR2API_CLIENT_TYPE", "cli")
+CLIENT_TYPE_PREFIXES = {"sand/": "sand", "bot/": "sand", "grokbot/": "sand",
+                        "cli/": "cli"}
+
+
+def split_client_type(name, default=None):
+    """`sand/claude-opus-5` -> ("sand", "claude-opus-5"); plain names pass through."""
+    text = (name or "").strip()
+    for prefix, client_type in CLIENT_TYPE_PREFIXES.items():
+        if text.lower().startswith(prefix):
+            return client_type, text[len(prefix):].strip()
+    return default or CLIENT_TYPE, text
+
+
 # Workspace path announced to the agent. It is only meaningful for the sandbox, so
 # it points there rather than leaking the directory the proxy happens to run in.
 WS = os.environ.get("CURSOR_WS") or os.path.join(tempfile.gettempdir(), "cursor-sandbox")
@@ -129,8 +150,9 @@ class Session:
 
     def __init__(self, model="claude-fable-5", system=None, tools=None,
                  web=True, workspace=False, model_params=None, debug=False,
-                 chat=False):
+                 chat=False, client_type=None):
         self.model, self.system, self.tools = model, system, tools or []
+        self.client_type = client_type or CLIENT_TYPE
         self.web, self.workspace, self.debug = web, workspace, debug
         # Plain chat: no caller tools and no attachments, so nothing the agent's
         # builtin file/shell tools could do is of any use to the caller.
@@ -206,12 +228,14 @@ class Session:
             "connect-protocol-version": "1",
             "connect-accept-encoding": "gzip",
             "user-agent": "connect-es/1.6.1",
-            "x-cursor-client-type": "cli",
+            "x-cursor-client-type": self.client_type,
             "x-cursor-client-version": VERSION,
             "x-ghost-mode": "false",
             "x-request-id": self.rid,
             "x-original-request-id": self.rid,
         }
+        if self.client_type == "sand":
+            headers["x-sand-box-namespace"] = "prod"
         self.attached = bool(images or documents)
         self.conn = h2stream.acquire(HOST)
         self.conn.start(PATH, headers)
@@ -474,17 +498,33 @@ def _web_search(tool_call):
 
 
 def _mcp_value(v):
-    """McpArgs values are google.protobuf.Value-ish; recover a python value."""
+    """McpArgs values are google.protobuf.Value; recover a python value.
+
+    Nested kinds are decoded recursively: struct_value (field 5) becomes a
+    dict and list_value (field 6) becomes a list, so object/array tool
+    arguments survive instead of leaking raw protobuf bytes to the caller.
+    """
     try:
         toks = parse(v)
     except Exception:
         return v.decode("utf-8", "replace")
     for fn, wt, val in toks:
-        if fn == 3 and wt == 2:
-            return val.decode("utf-8", "replace")   # string_value
+        if fn == 1 and wt == 0:
+            return None                              # null_value
         if fn == 2 and wt == 1:
             import struct
-            return struct.unpack("<d", val)[0]      # number_value
+            return struct.unpack("<d", val)[0]       # number_value
+        if fn == 3 and wt == 2:
+            return val.decode("utf-8", "replace")    # string_value
         if fn == 4 and wt == 0:
-            return bool(val)                        # bool_value
+            return bool(val)                         # bool_value
+        if fn == 5 and wt == 2:                      # struct_value
+            obj = {}
+            for kv in getall(val, 1):
+                k = (get(kv, 1) or b"").decode("utf-8", "replace")
+                ev = get(kv, 2)
+                obj[k] = _mcp_value(ev) if ev is not None else None
+            return obj
+        if fn == 6 and wt == 2:                      # list_value
+            return [_mcp_value(item) for item in getall(val, 1)]
     return v.decode("utf-8", "replace")

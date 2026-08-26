@@ -1,3 +1,4 @@
+# Bytecode / packaging
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -5,14 +6,26 @@ build/
 dist/
 .venv/
 venv/
-
-# never commit credentials or captured traffic
 .env
-*.env
+.env.*
+!.env.example
+
+# Credentials, captured traffic, local logs — never commit these
 auth.json
 credentials.json
 *.pem
+*.key
 *.bin
 *.flow
 *.har
+*.log
+*.pid
 bench-*.log
+server.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.bak
+*.swp

@@ -14,8 +14,9 @@ installed CLI bundle.
     connect-accept-encoding: gzip
     authorization: Bearer <access token>
     user-agent: connect-es/1.6.1
-    x-cursor-client-type: cli
-    x-cursor-client-version: cli-<version>
+    x-cursor-client-type: cli | sand
+    x-cursor-client-version: cli-<version>   # must be a CLI build, even for sand
+    x-sand-box-namespace: prod               # only when client-type is sand
     x-ghost-mode: false
     x-request-id / x-original-request-id: <uuid>
 
@@ -136,3 +137,18 @@ Web search and fetch are Cursor's own server-side tools, enabled by
 `ToolCall.web_search` (query, then title/url/snippet references) and the proxy
 converts them to Anthropic `server_tool_use` and `web_search_tool_result` blocks.
 `encrypted_content` stays empty and there are no citation blocks.
+
+## Client identity and usage pools
+
+`x-cursor-client-type` selects the meter. `cli` is the plan included/bonus pool.
+`sand` is the Grok Bot weekly pool (desktop bundle id `com.anysphere.sand`).
+The version header must still name a CLI build; a desktop `0.18.0` on this
+`AgentService/Run` stream is `permission_denied`.
+
+Related Dashboard RPCs (unary Connect JSON, empty body, same access token):
+
+    POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandAccessStatus
+    POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus
+
+See [usage-pools.md](usage-pools.md).
+
