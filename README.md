@@ -202,6 +202,9 @@ See [.env.example](.env.example). Common variables:
 | `CURSOR2API_LIVE_TTL` | `150` | seconds a parked tool-call stream is kept |
 | `CURSOR2API_WEB` | `1` | enable Cursor server-side web search/fetch |
 | `CURSOR2API_THINKING` | `auto` | when to request reasoning |
+| `IDLE_STOP` | `180` | safety net if the stream never closes |
+| `FIRST_TIMEOUT` | `90` | cut a turn that never gets a first frame |
+| `FIRST_OUTPUT_TIMEOUT` | `240` | cut a warm stream that never produces text/thinking/tool_use |
 
 ## Architecture (short)
 

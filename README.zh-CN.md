@@ -194,6 +194,9 @@ curl -s -X POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsage
 | `CURSOR2API_LIVE_TTL` | `150` | 工具调用活会话保留秒数 |
 | `CURSOR2API_WEB` | `1` | 打开 Cursor 服务端搜索/抓取 |
 | `CURSOR2API_THINKING` | `auto` | 何时请求 reasoning |
+| `IDLE_STOP` | `180` | 兜底：流带不关闭时强制结束 |
+| `FIRST_TIMEOUT` | `90` | 上游从未给出任何回复就切断 |
+| `FIRST_OUTPUT_TIMEOUT` | `240` | 流已经热了但没有 text/thinking/tool_use 就切断 |
 
 ## 架构（简）
 

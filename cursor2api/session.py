@@ -168,8 +168,9 @@ class Session:
         self.name_of_wire = {v: k for k, v in self.wire_name.items()}
         self.by_norm = {_normalise(t["name"]): t["name"] for t in self.tools}
         self.blobs = {}                 # KV blob store the server writes through us
-        self.last_activity = None      # last non-heartbeat server event
+        self.last_activity = None      # last frame carrying interaction/exec content
         self.last_frame = None         # last server message of any kind, heartbeats too
+        self.first_output = False      # any user-visible output or terminal event yet
         self.turn_ended = False
         self.attached = False          # uploads come back down as builtin write/read
 
@@ -244,6 +245,7 @@ class Session:
     def send_tool_results(self, results):
         """results: [(exec_id_int, exec_id_str, text, is_error)] answered as McpResult"""
         self.turn_ended = False
+        self.first_output = False      # first output of the next model step
         self.last_activity = self.last_frame = time.time()
         for eid, esid, text, is_error in results:
             content = msg(f1=msg(f1=str(text)))          # McpToolResultContentItem{text}
@@ -261,7 +263,8 @@ class Session:
             self.conn = None
 
     # ---- event loop -------------------------------------------------------
-    def events(self, idle_stop=180.0, hard_timeout=600.0, first_timeout=90.0):
+    def events(self, idle_stop=180.0, hard_timeout=600.0, first_timeout=90.0,
+               first_output_timeout=None):
         """Yields ('text'|'thinking'|'tool_use'|'web'|'tick'|'end'|'error', payload).
 
         A turn normally ends on turn_ended or when the stream closes; `idle_stop`
@@ -272,14 +275,37 @@ class Session:
         'tick' fires while the upstream is quiet, so the HTTP layer can keep the
         caller's connection alive. A turn that never produces any event at all is
         cut after `first_timeout` instead of `hard_timeout`: a stalled upstream
-        otherwise looks like a hung proxy for minutes.
+        otherwise looks like a hung proxy for minutes. Once the upstream has
+        answered, control chatter alone cannot reset `first_timeout`; if nothing
+        yields a user-visible event for `first_output_timeout` the stream is
+        abandoned with an explicit error and the H2 session is torn down, so the
+        API caller falls through the normal error path instead of discovering a
+        zero-output turn at `hard_timeout`. (first output = text/thinking/
+        tool_use/web/dbg or a terminal event; control frames merely imply a
+        minimal delay so the sandbox/context handshake can finish.)
         """
         t0 = time.time()
-        self.last_activity = self.last_frame = None
+        # send_tool_results seeds last_activity when a new model step starts;
+        # a fresh events() call (e.g. for the initial start()) clears it.
+        if self.first_output:                      # finished previous step
+            self.last_activity = self.last_frame = None
+        else:
+            self.last_frame = None
         while time.time() - t0 < hard_timeout:
             try:
                 kind, val = self.conn.events.get(timeout=0.5)
             except Exception:
+                kind, val = None, None
+            if (not self.first_output and first_output_timeout
+                    and self.last_activity is not None
+                    and time.time() - self.last_activity > first_output_timeout):
+                # Control frames seeded the clock but no user-visible event came
+                # out of them within the budget: abandon the turn loudly instead
+                # of floating to hard_timeout with a zero-output "success".
+                self.close()
+                yield "error", f"upstream produced no output for {int(first_output_timeout)}s"
+                return
+            if kind is None:
                 if self._idle_over(idle_stop):
                     yield "end", "idle"
                     return
@@ -305,6 +331,11 @@ class Session:
                     yield "end", "trailer"
                     return
                 for ev in self._handle(payload):
+                    if not self.first_output and (
+                            ev[0] in ("text", "thinking", "tool_use", "web", "dbg")
+                            or self.turn_ended):
+                        self.first_output = True
+                        self.last_activity = time.time()
                     yield ev
                 if self.turn_ended:
                     yield "end", "turn_ended"
@@ -312,7 +343,8 @@ class Session:
             if self._idle_over(idle_stop):
                 yield "end", "idle"
                 return
-        yield "end", "timeout"
+        self.close()
+        yield "error", f"turn exceeded hard timeout of {int(hard_timeout)}s"
 
     def _redirect(self, field):
         """Text refusing a builtin tool in favour of the caller's own tools.
@@ -375,7 +407,10 @@ class Session:
         self.last_frame = time.time()
         iu = get(sm, 1)
         if iu is not None:
-            if {fn for fn, wt, v in parse(iu)} != {13}:      # anything but a heartbeat
+            if {fn for fn, wt, v in parse(iu)} & {1, 4}:
+                # text/thinking arrived; control frames (usage 14, heartbeat 13,
+                # dbg-only oddities) do not count, so a one-way stream that only
+                # talks to itself still hits first_timeout/first_output_timeout.
                 self.last_activity = time.time()
             td = get(iu, 1)
             if td is not None and get(td, 1):
@@ -406,16 +441,24 @@ class Session:
             return out
         ex = get(sm, 2)
         if ex is not None:
-            self.last_activity = time.time()
+            # Any exec-family message proves the agent is alive. Only mcp_args
+            # leads to a caller-visible event, but message traffic alone must at
+            # least seed the first-output clock so first_output_timeout can fire
+            # once context/allowlist/sandbox chatter has died down without the
+            # model ever producing text/thinking/tool output.
+            first_exec = self.last_activity is None and not self.first_output
             eid = getvar(ex, 1) or 0
             esid = get(ex, 15)
             esid = esid.decode() if esid else None
             fields = {fn for fn, wt, v in parse(ex)}
             if self.debug:
                 out.append(("dbg", f"exec {sorted(fields - {1, 15, 19})}"))
+            if first_exec:
+                self.last_activity = time.time()
             if 10 in fields:                      # request_context_args
                 self._send(self._context_reply(eid or None, esid))
             elif 11 in fields:                    # mcp_args -> real tool call
+                self.last_activity = time.time()
                 a = get(ex, 11)
                 name = (get(a, 5) or get(a, 1) or b"").decode()
                 name = self.name_of_wire.get(name, name)
@@ -428,17 +471,16 @@ class Session:
                 out.append(("tool_use", {"id": tcid or "toolu_" + uuid.uuid4().hex[:16],
                                          "name": name, "input": args,
                                          "exec": (eid or None, esid)}))
+            key = next((k for k in (41, 42, 43) if k in fields), None)
+            if key:                           # allowlist precheck -> allowlisted
+                inner = {"f%d" % key: msg(f1=True)}
+                if eid:
+                    inner["f1"] = eid
+                if esid:
+                    inner["f15"] = esid
+                self._send(msg(f2=msg(**inner)))
             else:
-                key = next((k for k in (41, 42, 43) if k in fields), None)
-                if key:                           # allowlist precheck -> allowlisted
-                    inner = {"f%d" % key: msg(f1=True)}
-                    if eid:
-                        inner["f1"] = eid
-                    if esid:
-                        inner["f15"] = esid
-                    self._send(msg(f2=msg(**inner)))
-                else:
-                    self._builtin_tool(fields, ex, eid, esid, out)
+                self._builtin_tool(fields, ex, eid, esid, out)
             return out
         kv = get(sm, 4)
         if kv is not None:

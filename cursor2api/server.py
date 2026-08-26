@@ -42,6 +42,10 @@ DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "claude-fable-5")
 # writes and long reasoning go minutes without a frame, so this stays generous.
 IDLE_STOP = float(os.environ.get("IDLE_STOP", "180"))
 FIRST_TIMEOUT = float(os.environ.get("FIRST_TIMEOUT", "90"))  # upstream never answered
+# No user-visible output for this long after the upstream started answering:
+# control chatter and heartbeats must not keep a zero-output turn alive until
+# the 900s hard timeout, because downstream used to log that as a success.
+FIRST_OUTPUT_TIMEOUT = float(os.environ.get("FIRST_OUTPUT_TIMEOUT", "240"))
 WEB = os.environ.get("CURSOR2API_WEB", "1") == "1"
 # auto: think only when the caller asks for it or names a thinking variant. Cursor's
 # defaults turn reasoning on for every model, which triples the time to first token.
@@ -317,7 +321,8 @@ class Turn:
     def stream(self):
         """Yields ('thinking'|'text'|'tool_use'|'done'|'error', value)."""
         for kind, val in self.session.events(idle_stop=IDLE_STOP, hard_timeout=900,
-                                             first_timeout=FIRST_TIMEOUT):
+                                             first_timeout=FIRST_TIMEOUT,
+                                             first_output_timeout=FIRST_OUTPUT_TIMEOUT):
             if kind == "tick":
                 yield "tick", None
             elif kind == "text":
