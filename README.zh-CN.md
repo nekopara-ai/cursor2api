@@ -192,8 +192,14 @@ curl -s -X POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsage
 | `CURSOR_CLI_VERSION` | `cli-2026.08.11-e8db854` | `x-cursor-client-version` |
 | `CURSOR2API_PROXY` / `https_proxy` | — | HTTP/2 流的 HTTP CONNECT 代理 |
 | `CURSOR2API_LIVE_TTL` | `150` | 工具调用活会话保留秒数 |
+| `CURSOR2API_TOOL_OWNER` | `caller` | `caller` = 只把调用方声明的工具暴露给模型；`cursor` = 旧版内置工具行为 |
 | `CURSOR2API_WEB` | `1` | 打开 Cursor 服务端搜索/抓取 |
 | `CURSOR2API_THINKING` | `auto` | 何时请求 reasoning |
+| `CURSOR2API_SEND_TIMEOUT` | `120` | H2 一次 send 等待 flow-control 窗口打开的上限 |
+| `CURSOR2API_LOG_TURNS` | `1` | 每轮一条结构化 JSON 日志到 stderr |
+| `CURSOR2API_MAX_BODY` | `67108864` | 请求体大小上限，字节 |
+| `MODEL_CACHE_FAIL_TTL` | `60` | 模型目录拉取失败后的缓存秒数 |
+| `CURSOR2API_HTTP_IDLE` | `300` | 本服务 HTTP/1.1 连接的空闲超时 |
 | `IDLE_STOP` | `180` | 兜底：流带不关闭时强制结束 |
 | `FIRST_TIMEOUT` | `90` | 上游从未给出任何回复就切断 |
 | `FIRST_OUTPUT_TIMEOUT` | `240` | 流已经热了但没有 text/thinking/tool_use 就切断 |

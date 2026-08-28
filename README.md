@@ -200,8 +200,14 @@ See [.env.example](.env.example). Common variables:
 | `CURSOR_CLI_VERSION` | `cli-2026.08.11-e8db854` | `x-cursor-client-version` |
 | `CURSOR2API_PROXY` / `https_proxy` | — | HTTP CONNECT for the HTTP/2 stream |
 | `CURSOR2API_LIVE_TTL` | `150` | seconds a parked tool-call stream is kept |
+| `CURSOR2API_TOOL_OWNER` | `caller` | `caller` = only the caller's tools are exposed to the model; `cursor` = legacy builtin tools |
 | `CURSOR2API_WEB` | `1` | enable Cursor server-side web search/fetch |
 | `CURSOR2API_THINKING` | `auto` | when to request reasoning |
+| `CURSOR2API_SEND_TIMEOUT` | `120` | max seconds one h2 send waits on a closed flow-control window |
+| `CURSOR2API_LOG_TURNS` | `1` | one structured JSON line per turn on stderr |
+| `CURSOR2API_MAX_BODY` | `67108864` | request body size cap, bytes |
+| `MODEL_CACHE_FAIL_TTL` | `60` | seconds a failed catalog fetch is cached before another try |
+| `CURSOR2API_HTTP_IDLE` | `300` | idle timeout for one HTTP/1.1 connection into this server |
 | `IDLE_STOP` | `180` | safety net if the stream never closes |
 | `FIRST_TIMEOUT` | `90` | cut a turn that never gets a first frame |
 | `FIRST_OUTPUT_TIMEOUT` | `240` | cut a warm stream that never produces text/thinking/tool_use |
