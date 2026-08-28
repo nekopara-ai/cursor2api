@@ -26,7 +26,7 @@ Not representable at all (accepted and ignored)
 Run:   PORT=8787 API_KEY=sk-local python -m cursor2api serve
 Use:   ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_API_KEY=sk-local claude
 """
-import base64, json, os, struct, sys, threading, time, uuid
+import base64, errno, hmac, json, os, struct, sys, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import auth as auth_mod
@@ -52,6 +52,10 @@ WEB = os.environ.get("CURSOR2API_WEB", "1") == "1"
 THINKING = os.environ.get("CURSOR2API_THINKING", "auto")
 PING = float(os.environ.get("PING_INTERVAL", "5"))   # SSE keepalive while upstream is quiet
 DEBUG = bool(os.environ.get("DBG"))
+# One structured line per turn. The service used to log nothing but its own
+# restarts, so every incident had to be reconstructed from client transcripts.
+LOG_TURNS = os.environ.get("CURSOR2API_LOG_TURNS", "1") == "1"
+MAX_BODY = int(os.environ.get("CURSOR2API_MAX_BODY", str(64 * 1024 * 1024)))
 
 # ---- live tool-call sessions ------------------------------------------------
 # A turn that stops at tool_use leaves the Run stream open waiting for the
@@ -73,6 +77,22 @@ def _live_gc_locked():
                 entry["session"].close()
             except Exception:
                 pass
+
+
+def _live_gc_loop():
+    """Reap expired parked sessions on a timer.
+
+    Collection used to run only when a new request arrived, so an abandoned
+    tool call held its H2 connection and reader thread until traffic resumed.
+    """
+    period = min(30.0, max(5.0, LIVE_TTL / 4))
+    while True:
+        time.sleep(period)
+        try:
+            with _live_lock:
+                _live_gc_locked()
+        except Exception:
+            pass
 
 
 def register_live(turn):
@@ -115,6 +135,14 @@ def claim_live(body, model, client_type):
                 return None
             session = entry["session"]
             claimed.append((entry, b))
+        # A parked session waits for *all* of its tool results on one live
+        # stream. Resuming with only a subset would leave the upstream blocked
+        # on the missing ones (until FIRST_OUTPUT_TIMEOUT) and strand the
+        # leftover parked ids pointing at a dead stream; replay fresh instead.
+        wanted = {b.get("tool_use_id") for b in blocks}
+        parked = {k for k, v in _live_sessions.items() if v["session"] is session}
+        if wanted != parked:
+            return None
         for b in blocks:
             _live_sessions.pop(b.get("tool_use_id"), None)
     return claimed
@@ -209,8 +237,10 @@ def render_history(messages):
         body = "\n".join(x for x in chunks if x)
         if body:
             lines.append(("Human: " if role == "user" else "Assistant: ") + body)
-    if len(lines) == 1:
+    if len(lines) == 1 and lines[0].startswith("Human: "):
         prompt = lines[0][len("Human: "):]
+    elif len(lines) == 1:
+        prompt = lines[0]
     else:
         prompt = "\n\n".join(lines) + "\n\nAssistant:"
     return prompt, images, docs
@@ -234,6 +264,32 @@ def tool_specs(tools):
     return out
 
 
+# Reasoning levels, weakest to strongest. Callers spell them in several ways and
+# each model family publishes its own subset, so a request is clamped onto the
+# nearest level the target model actually declares rather than sent verbatim
+# (Cursor rejects a parameter value it does not know).
+EFFORT_LADDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+EFFORT_ALIASES = {"minimal": "low", "default": "medium", "highest": "max"}
+# Anthropic states the same intent as a token budget; these are the boundaries
+# used to bucket it back onto the ladder.
+# LiteLLM emits 1024/2048/4096 for the low/medium/high efforts a Codex client
+# can select, so anything above the medium budget is carried through as the
+# strongest level the target model publishes.
+EFFORT_BUDGETS = ((1024, "low"), (2048, "medium"))
+
+
+def nearest_effort(level, allowed):
+    """The published level closest to the one asked for, or None."""
+    if level in allowed:
+        return level
+    if level not in EFFORT_LADDER:
+        return None
+    want = EFFORT_LADDER.index(level)
+    ranked = sorted((abs(EFFORT_LADDER.index(a) - want), a)
+                    for a in allowed if a in EFFORT_LADDER)
+    return ranked[0][1] if ranked else None
+
+
 # --------------------------------------------------------------- live turns
 class Turn:
     """Runs one assistant turn and yields normalized deltas."""
@@ -242,6 +298,7 @@ class Turn:
         self.body = body
         self.client_type, self.model_in = split_client_type(body.get("model", DEFAULT_MODEL))
         self.model, self.model_params = models.resolve(self.model_in, DEFAULT_MODEL)
+        self.model_options = models.options(self.model)
         self.tools = tool_specs(body.get("tools"))
         self.want_thinking = bool((body.get("thinking") or {}).get("type") == "enabled")
         self.stops = [s for s in (body.get("stop_sequences") or []) if s]
@@ -258,14 +315,50 @@ class Turn:
         self.text_so_far = ""
         self.sent_chars = 0        # chars actually sent upstream, for usage estimates
         self.think_chars = 0       # thinking chars received, for usage estimates
+        self.resumed = False       # continued a parked stream instead of replaying
+        self._usage_final = None   # usage_of() result, computed once per turn
+        self.error = None          # upstream error text, for the turn log
+
+    def _effort(self):
+        """Reasoning level the caller asked for, in ladder terms, or None."""
+        think = self.body.get("thinking") or {}
+        raw = think.get("effort") or self.body.get("reasoning_effort") or ""
+        raw = str(raw).strip().lower()
+        if raw:
+            return EFFORT_ALIASES.get(raw, raw)
+        try:
+            budget = int(think.get("budget_tokens"))
+        except (TypeError, ValueError):
+            return None
+        for cutoff, name in EFFORT_BUDGETS:
+            if budget <= cutoff:
+                return name
+        return "max"
 
     def _tune(self, images, docs):
         """Drop reasoning for turns that did not ask for it (time to first token)."""
         params = dict(self.model_params or {})
-        if THINKING == "off" or (THINKING == "auto" and not self.want_thinking
-                                 and "think" not in (self.model_in or "").lower()
-                                 and "thinking" in params):
-            params["thinking"] = "false"
+        # `thinking` is only a real parameter on the families that publish it;
+        # composer and the grok line have no such id and reject one.
+        if "thinking" in self.model_options or "thinking" in params:
+            if THINKING == "off" or (THINKING == "auto" and not self.want_thinking
+                                     and "think" not in (self.model_in or "").lower()):
+                params["thinking"] = "false"
+            elif self.want_thinking:
+                params["thinking"] = "true"
+        level = self._effort()
+        if level and params.get("thinking") != "false":
+            # claude/grok publish this as `effort`, the gpt and kimi families as
+            # `reasoning`; without this the level was parsed and then dropped, so
+            # low and high reached the backend as the same request.
+            for pid in ("effort", "reasoning"):
+                allowed = self.model_options.get(pid)
+                if not allowed:
+                    continue
+                pick = nearest_effort(level, allowed)
+                if pick:
+                    params[pid] = pick
+                break
         self.model_params = params
         self.chat = not self.tools and not images and not docs
 
@@ -305,6 +398,7 @@ class Turn:
     def resume(self, claimed):
         """Continue a parked live session by answering its tool calls."""
         self.session = claimed[0][0]["session"]
+        self.resumed = True
         results = []
         chars = 0
         for entry, block in claimed:
@@ -342,13 +436,18 @@ class Turn:
                 self.pending.append(val)
                 self.stop_reason = "tool_use"
                 yield "tool_use", val
-                return                     # hand control back to the API caller
+                if not self.session.buffered():
+                    return                 # hand control back to the API caller
+                # More of this batch is already decoded: parallel calls share a
+                # frame, and stopping here used to drop every call after the
+                # first, leaving the agent waiting on a result that never came.
             elif kind == "turn_ended":
                 self.usage.update({k: v for k, v in val.items()
                                    if k in ("input_tokens", "output_tokens",
                                             "cache_read_input_tokens",
                                             "cache_creation_input_tokens")})
             elif kind == "error":
+                self.error = val
                 yield "error", val
                 return
             elif kind == "end":
@@ -377,6 +476,14 @@ class Turn:
 
 
 # ------------------------------------------------------------------ HTTP I/O
+def web_lines(ws):
+    """Cursor's server-side web search -> plain text for the OpenAI shim."""
+    out = ["\n[web] %s %s" % (r["title"], r["url"]) for r in ws.get("results", [])]
+    if not out and ws.get("summary"):
+        out.append("\n[web] " + ws["summary"])
+    return "".join(out)
+
+
 def web_blocks(ws):
     """Cursor's server-side web search -> Anthropic server_tool_use pair."""
     tid = ws.get("id") or "srvtoolu_" + uuid.uuid4().hex[:16]
@@ -400,6 +507,10 @@ def upstream_error(msg):
     if "RATE_LIMIT" in m or "resource_exhausted" in m:
         return 429, "rate_limit_error", "Cursor rate limit reached, retry later"
     if "NOT_LOGGED_IN" in m or "unauthenticated" in m or "HTTP 401" in m:
+        # A revoked token stays "valid" by its exp claim for up to an hour;
+        # drop the cache so the next turn re-exchanges the API key or picks a
+        # fresher credential instead of replaying the dead one.
+        auth_mod.invalidate_cached()
         return 401, "authentication_error", "Cursor rejected the credentials"
     if "MODEL_BLOCKED" in m:
         return 403, "permission_error", (
@@ -412,27 +523,98 @@ def upstream_error(msg):
     return 502, "api_error", m
 
 
-def usage_of(turn):
-    """Anthropic usage, including the cache counters Cursor reports on turn end.
+_cpt_lock = threading.Lock()
+_cpt = [4.0]        # chars per prompt token, calibrated against real counters
 
-    Cursor only reports real counters in the turn_ended frame, which never
-    arrives for turns that stop at a tool_use (control goes back to the API
-    caller while Cursor's turn stays open). Those turns used to report
-    input_tokens=0, which broke accounting downstream (LiteLLM spend logs saw
-    0 prompt tokens on nearly every agent request). Estimate missing sides at
-    ~4 chars/token from what was actually sent and received instead.
+
+def _calibrate_cpt(chars, tokens):
+    """Learn the prompt chars-per-token ratio from turns Cursor counted cleanly."""
+    if tokens < 1000 or chars < 4000:
+        return
+    ratio = chars / tokens
+    if not 1.5 <= ratio <= 12.0:
+        return
+    with _cpt_lock:
+        _cpt[0] = _cpt[0] * 0.7 + ratio * 0.3
+
+
+def prompt_chars(turn):
+    """Size of the prompt this API request carried, in characters."""
+    body = turn.body if isinstance(turn.body, dict) else {}
+    try:
+        return sum(len(json.dumps(body.get(k) or d, ensure_ascii=False))
+                   for k, d in (("system", ""), ("messages", []), ("tools", [])))
+    except (TypeError, ValueError):
+        return 0
+
+
+def usage_of(turn):
+    """Anthropic usage for one API request.
+
+    Two Cursor behaviours have to be undone here. Cursor only reports real
+    counters in the turn_ended frame, which never arrives for turns that stop
+    at a tool_use (control goes back to the API caller while Cursor's turn
+    stays open); those turns are estimated from characters. And when the frame
+    does arrive it carries counters accumulated over Cursor's *whole* turn,
+    which spans every parked sub-request, so reporting it verbatim told the
+    caller its context window was nearly full after a few tool calls.
+
+    The prompt sides are therefore clamped to the prompt this request actually
+    carried, split across the cache counters so the three add up, and the
+    estimates already billed on parked sub-requests are handed to the session
+    so the next real frame can subtract them.
     """
-    u = {"input_tokens": turn.usage.get("input_tokens", 0),
-         "output_tokens": turn.usage.get("output_tokens", 0)}
-    if not u["input_tokens"]:                   # no turn_ended: estimate
-        u["input_tokens"] = max(1, turn.sent_chars // 4)
-    if not u["output_tokens"]:                  # turn cut short: estimate
-        out_chars = (len(turn.text_so_far) + turn.think_chars
-                     + sum(len(json.dumps(tu, ensure_ascii=False)) for tu in turn.pending))
-        u["output_tokens"] = max(1, out_chars // 4)
-    for k in ("cache_read_input_tokens", "cache_creation_input_tokens"):
-        u[k] = turn.usage.get(k, 0)
-    return u
+    if turn._usage_final is not None:
+        return dict(turn._usage_final)
+
+    real_in = turn.usage.get("input_tokens", 0)
+    real_out = turn.usage.get("output_tokens", 0)
+    chars = prompt_chars(turn)
+    if real_in and not turn.resumed and not turn.pending:
+        _calibrate_cpt(chars, real_in)
+    with _cpt_lock:
+        cpt = _cpt[0]
+
+    est_in = max(1, int(chars / cpt)) if chars else max(1, turn.sent_chars // 4)
+    out_chars = (len(turn.text_so_far) + turn.think_chars
+                 + sum(len(json.dumps(tu, ensure_ascii=False)) for tu in turn.pending))
+    est_out = max(1, int(out_chars / cpt))
+
+    total_in = min(real_in, est_in) if real_in else est_in
+    read = min(turn.usage.get("cache_read_input_tokens", 0), total_in)
+    created = min(turn.usage.get("cache_creation_input_tokens", 0), total_in - read)
+    u = {"input_tokens": max(1, total_in - read - created),
+         "output_tokens": real_out or est_out,
+         "cache_read_input_tokens": read,
+         "cache_creation_input_tokens": created}
+
+    if not turn.usage and turn.session is not None:
+        seen = turn.session._usage_est
+        for k in ("input_tokens", "output_tokens"):
+            seen[k] = seen.get(k, 0) + u[k]
+    turn._usage_final = u
+    return dict(u)
+
+
+def log_turn(turn, status, started, parked=False):
+    """One structured line per turn, so failures can be read off the log."""
+    if not LOG_TURNS:
+        return
+    try:
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "status": status, "model": turn.model, "requested": turn.model_in,
+               "client_type": turn.client_type, "params": turn.model_params,
+               "tools": len(turn.tools), "tool_calls": len(turn.pending),
+               "resumed": turn.resumed, "parked": parked,
+               "stop_reason": turn.stop_reason,
+               "ms": int((time.time() - started) * 1000),
+               "usage": usage_of(turn)}
+        if turn.error:
+            rec["error"] = str(turn.error)[:300]
+        sys.stderr.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def sse(event, data):
@@ -442,6 +624,9 @@ def sse(event, data):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "cursor2api/1.0"
+    timeout = float(os.environ.get("CURSOR2API_HTTP_IDLE", "300"))
+    _headers_sent = False
+    _stream_flavor = None
 
     def log_message(self, fmt, *a):
         if DEBUG:
@@ -463,15 +648,55 @@ class Handler(BaseHTTPRequestHandler):
         self._json(code, {"type": "error",
                           "error": {"type": kind, "message": message}}, headers)
 
+    def _finish_chunked(self):
+        """Write the terminating chunk.
+
+        Without it a keep-alive client blocks until its own timeout and the
+        connection is left mid-body, so the next request on the socket reads
+        the leftovers as a malformed request.
+        """
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def _fail(self, code, kind, message):
+        """Report an error, honouring a stream whose headers already went out.
+
+        Calling send_response() again after that writes a second status line
+        into the chunked body, which the client sees as a corrupt frame.
+        """
+        if not self._headers_sent:
+            return self._err(code, kind, message)
+        try:
+            if self._stream_flavor == "openai":
+                raw = (b"data: " + json.dumps({"error": {"message": message,
+                                                         "type": kind}}).encode()
+                       + b"\n\n")
+            else:
+                raw = sse("error", {"type": "error",
+                                    "error": {"type": kind, "message": message}})
+            self.wfile.write(b"%x\r\n" % len(raw) + raw + b"\r\n")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        self._finish_chunked()
+
     def _authed(self):
         if not API_KEY:
             return True
-        key = self.headers.get("x-api-key") or ""
         auth = self.headers.get("authorization") or ""
-        return key == API_KEY or auth.replace("Bearer ", "") == API_KEY
+        bearer = auth[7:].strip() if auth[:7].lower() == "bearer " else auth
+        for presented in (self.headers.get("x-api-key") or "", bearer):
+            if presented and hmac.compare_digest(presented, API_KEY):
+                return True
+        return False
 
     def _body(self):
         n = int(self.headers.get("content-length") or 0)
+        if n > MAX_BODY:
+            raise ValueError("request body of %d bytes exceeds the %d byte limit"
+                             % (n, MAX_BODY))
         return json.loads(self.rfile.read(n) or b"{}")
 
     @staticmethod
@@ -511,6 +736,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        # A keep-alive connection reuses this handler instance for every request.
+        self._headers_sent = False
+        self._stream_flavor = None
         if not self._authed():
             return self._err(401, "authentication_error", "invalid x-api-key")
         route = self.path.split("?")[0].rstrip("/")
@@ -538,6 +766,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(400, "invalid_request_error", "messages: required")
 
         turn = Turn(body)
+        started = time.time()
+        status = "ok"
         claimed = None
         try:
             claimed = claim_live(body, turn.model, turn.client_type)
@@ -562,19 +792,27 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._buffer_turn(turn)
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            status = "client_gone"
         except AuthError as e:
-            self._err(401, "authentication_error", str(e))
+            status = "auth_error"
+            turn.error = str(e)
+            self._fail(401, "authentication_error", str(e))
         except Exception as e:
+            status = "exception"
+            turn.error = f"{type(e).__name__}: {e}"
             if DEBUG:
                 import traceback
                 traceback.print_exc()
             try:
-                self._err(500, "api_error", f"{type(e).__name__}: {e}")
+                self._fail(500, "api_error", f"{type(e).__name__}: {e}")
             except Exception:
                 pass
         finally:
-            if not register_live(turn):
+            parked = register_live(turn)
+            if turn.error and status == "ok":
+                status = "upstream_error"
+            log_turn(turn, status, started, parked)
+            if not parked:
                 turn.close()
 
     # -- non-streaming
@@ -618,6 +856,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("connection", "keep-alive")
         self.send_header("transfer-encoding", "chunked")
         self.end_headers()
+        self._headers_sent = True
+        self._stream_flavor = "anthropic"
         mid = "msg_" + uuid.uuid4().hex[:24]
 
         def chunk(raw):
@@ -686,7 +926,7 @@ class Handler(BaseHTTPRequestHandler):
                 _, kind, text_err = upstream_error(val)
                 chunk(sse("error", {"type": "error",
                                     "error": {"type": kind, "message": text_err}}))
-                return
+                return self._finish_chunked()
             last_ping = time.time()
 
         close_block()
@@ -696,8 +936,7 @@ class Handler(BaseHTTPRequestHandler):
                       "stop_sequence": turn.stop_sequence},
             "usage": usage_of(turn)}))
         chunk(sse("message_stop", {"type": "message_stop"}))
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
+        self._finish_chunked()
 
     # -- OpenAI chat completions
     def _buffer_turn_openai(self, turn):
@@ -711,8 +950,7 @@ class Handler(BaseHTTPRequestHandler):
             elif kind == "text":
                 text.append(val)
             elif kind == "web":
-                text.append("".join("\n[web] %s %s" % (r["title"], r["url"])
-                                    for r in val.get("results", [])))
+                text.append(web_lines(val))
             elif kind == "error":
                 err = val
         if err:
@@ -728,6 +966,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("connection", "keep-alive")
         self.send_header("transfer-encoding", "chunked")
         self.end_headers()
+        self._headers_sent = True
+        self._stream_flavor = "openai"
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
 
         def send(obj):
@@ -754,9 +994,9 @@ class Handler(BaseHTTPRequestHandler):
             elif kind == "thinking":
                 send(openai_api.chunk(cid, turn.model_in, {"reasoning_content": val}))
             elif kind == "web":
-                for r in val.get("results", []):
-                    send(openai_api.chunk(cid, turn.model_in, {
-                        "content": "\n[web] %s %s" % (r["title"], r["url"])}))
+                line = web_lines(val)
+                if line:
+                    send(openai_api.chunk(cid, turn.model_in, {"content": line}))
             elif kind == "tool_use":
                 send(openai_api.chunk(cid, turn.model_in,
                                       openai_api.tool_call_delta(calls, val)))
@@ -764,16 +1004,13 @@ class Handler(BaseHTTPRequestHandler):
             elif kind == "error":
                 _, kind, text_err = upstream_error(val)
                 send({"error": {"message": text_err, "type": kind}})
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
-                return
+                return self._finish_chunked()
         send(openai_api.chunk(cid, turn.model_in, {},
                              openai_api.FINISH.get(turn.stop_reason or "end_turn", "stop"),
                              usage_of(turn)))
         raw = b"data: [DONE]\n\n"
         self.wfile.write(b"%x\r\n" % len(raw) + raw + b"\r\n")
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
+        self._finish_chunked()
 
 
 _login_flow = {}
@@ -847,8 +1084,18 @@ def main():
             print("authorise this proxy at: %s" % flow.get("login_url", ""), flush=True)
     _background_warmup()
     threading.Thread(target=models.catalog, daemon=True).start()
+    threading.Thread(target=_live_gc_loop, daemon=True).start()
     ThreadingHTTPServer.request_queue_size = 256
-    srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    # A supervised restart races the old process releasing the port.
+    srv = None
+    for attempt in range(15):
+        try:
+            srv = ThreadingHTTPServer((BIND, PORT), Handler)
+            break
+        except OSError as e:
+            if e.errno != errno.EADDRINUSE or attempt == 14:
+                raise
+            time.sleep(1.0)
     srv.daemon_threads = True
     print(f"listening on http://{BIND}:{PORT} "
           f"(/v1/messages, /v1/chat/completions, /v1/models; "

@@ -10,6 +10,10 @@ import h2.connection, h2.events, h2.config
 
 POOL_SIZE = int(os.environ.get("CURSOR2API_POOL", "2"))
 MAX_IDLE = float(os.environ.get("CURSOR2API_POOL_IDLE", "40"))
+# Upper bound on how long one send() may wait for the peer to reopen the
+# flow-control window. Without it a peer that stops reading parks the caller
+# in an unbounded loop instead of failing the turn.
+SEND_TIMEOUT = float(os.environ.get("CURSOR2API_SEND_TIMEOUT", "120"))
 
 _pool = []
 _pool_lock = threading.Lock()
@@ -37,8 +41,12 @@ def _open_socket(host, port):
         if not chunk:
             break
         resp += chunk
-    code = int(resp.split(b" ", 2)[1])
-    assert 200 <= code < 300, f"CONNECT {host}:{port} via proxy failed: {resp[:120]!r}"
+    try:
+        code = int(resp.split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        raise OSError(f"CONNECT {host}:{port} via proxy: malformed reply {resp[:120]!r}")
+    if not 200 <= code < 300:
+        raise OSError(f"CONNECT {host}:{port} via proxy failed: {resp[:120]!r}")
     return raw
 
 class BidiH2:
@@ -50,7 +58,8 @@ class BidiH2:
         raw=_open_socket(host, port)
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock=ctx.wrap_socket(raw, server_hostname=host)
-        assert self.sock.selected_alpn_protocol()=="h2", "no h2 ALPN"
+        if self.sock.selected_alpn_protocol()!="h2":
+            raise OSError("upstream did not negotiate HTTP/2 over ALPN")
         self.conn=h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True))
         self.conn.initiate_connection()
         self._flush()
@@ -99,12 +108,13 @@ class BidiH2:
         self.reader=threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
 
-    def send(self, payload, end=False):
+    def send(self, payload, end=False, timeout=None):
         """Writes a payload, blocking on WINDOW_UPDATE when the peer's window is full.
 
         Long prompts exceed the initial 64KB stream window, so chunks must be sized by
         the live flow-control window, not just max_frame_size.
         """
+        deadline=time.time()+(SEND_TIMEOUT if timeout is None else timeout)
         i=0
         while i < len(payload):
             with self.lock:
@@ -115,8 +125,13 @@ class BidiH2:
                     self._flush()
                     i+=room
             if room <= 0:
+                if self.closed:
+                    raise OSError("connection closed while sending")
+                left=deadline-time.time()
+                if left <= 0:
+                    raise OSError("timed out waiting for the peer's flow-control window")
                 with self.window:
-                    self.window.wait(10)
+                    self.window.wait(min(1.0, left))
                 if self.closed:
                     raise OSError("connection closed while sending")
         with self.lock:
@@ -125,8 +140,16 @@ class BidiH2:
 
     def _read_loop(self):
         try:
+            # create_connection()'s handshake timeout is inherited by the TLS
+            # socket, so recv() used to raise after 30 idle seconds and tear down
+            # a stream that was merely waiting on a slow model. The turn-level
+            # idle_stop/hard_timeout guards in Session.events bound this instead.
+            self.sock.settimeout(None)
             while not self.closed:
-                data=self.sock.recv(65536)
+                try:
+                    data=self.sock.recv(65536)
+                except TimeoutError:
+                    continue
                 if not data:
                     self.events.put(("closed",None)); return
                 with self.lock:
@@ -142,9 +165,16 @@ class BidiH2:
                         self.events.put(("data",e.data))
                     elif isinstance(e,h2.events.WindowUpdated):
                         with self.window: self.window.notify_all()
-                    elif isinstance(e,(h2.events.StreamEnded,h2.events.StreamReset,
-                                       h2.events.ConnectionTerminated)):
+                    elif isinstance(e,h2.events.StreamEnded):
                         self.events.put(("end",type(e).__name__))
+                        self.closed=True
+                        with self.window: self.window.notify_all()
+                        return
+                    elif isinstance(e,(h2.events.StreamReset,
+                                       h2.events.ConnectionTerminated)):
+                        # A reset or GOAWAY truncates the turn; it must not reach
+                        # the caller as a normally finished stream.
+                        self.events.put(("error","upstream %s"%type(e).__name__))
                         self.closed=True
                         with self.window: self.window.notify_all()
                         return

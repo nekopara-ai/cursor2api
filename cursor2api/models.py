@@ -35,6 +35,9 @@ RPC = os.environ.get("CURSOR_AISERVER_URL", "https://api2.cursor.sh").rstrip("/"
     + "/aiserver.v1.AiService/AvailableModels"
 VERSION = os.environ.get("CURSOR_CLI_VERSION", "cli-2026.08.11-e8db854")
 TTL = float(os.environ.get("MODEL_CACHE_TTL", "900"))
+# A failed fetch is cached far more briefly than a good one: a network blip at
+# startup used to pin /v1/models to the built-in set for the whole TTL.
+FAIL_TTL = float(os.environ.get("MODEL_CACHE_FAIL_TTL", "60"))
 
 # Used when the catalog cannot be fetched (offline, expired credentials).
 FALLBACK = [
@@ -176,9 +179,18 @@ def catalog(refresh=False):
         except Exception:
             if _cache:
                 return _cache[1]
-            models = _fallback()
+            _cache = (time.time() - max(0.0, TTL - FAIL_TTL), _fallback())
+            return _cache[1]
         _cache = (time.time(), models)
         return models
+
+
+def options(model_id):
+    """Parameter ids a model publishes, mapped to their accepted values."""
+    for m in catalog():
+        if m["id"] == model_id:
+            return m["options"]
+    return {}
 
 
 def ids():

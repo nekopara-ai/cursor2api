@@ -73,6 +73,16 @@ def clear_store():
         return False
 
 
+def invalidate_cached():
+    """Drop the in-memory access token so the next request re-derives it.
+
+    The cache is normally trusted until the JWT's exp; a token revoked upstream
+    would otherwise keep failing with 401 until it expired on paper."""
+    global _cached
+    with _lock:
+        _cached = ""
+
+
 # ------------------------------------------------------------------ tokens
 def _expiring(jwt, skew=300):
     """True when the JWT is unusable or expires within `skew` seconds."""

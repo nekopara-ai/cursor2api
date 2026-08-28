@@ -100,14 +100,26 @@ def to_anthropic(body):
            "stream": bool(body.get("stream"))}
     if system:
         out["system"] = "\n\n".join(x for x in system if x)
-    for src, dst in (("max_completion_tokens", "max_tokens"), ("max_tokens", "max_tokens")):
+    # max_completion_tokens is the newer spelling and wins when both are sent;
+    # the other order silently capped a 32k request at a legacy max_tokens.
+    for src in ("max_tokens", "max_completion_tokens"):
         if body.get(src):
             out["max_tokens"] = body[src]
     stop = body.get("stop")
     if stop:
         out["stop_sequences"] = [stop] if isinstance(stop, str) else list(stop)
-    if body.get("reasoning_effort") not in (None, "none") or body.get("thinking"):
+    effort = body.get("reasoning_effort")
+    if effort in (None, "none") and isinstance(body.get("reasoning"), dict):
+        effort = body["reasoning"].get("effort")
+    thinking = body.get("thinking")
+    if effort not in (None, "none") or thinking:
+        # Carry the level through, not just the on/off bit: "low" and "high"
+        # used to reach the backend as the same request.
         out["thinking"] = {"type": "enabled"}
+        if effort:
+            out["thinking"]["effort"] = effort
+        if isinstance(thinking, dict) and thinking.get("budget_tokens"):
+            out["thinking"]["budget_tokens"] = thinking["budget_tokens"]
 
     tools = []
     for t in body.get("tools") or []:

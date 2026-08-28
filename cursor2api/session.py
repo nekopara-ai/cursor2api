@@ -43,6 +43,21 @@ CLIENT_TYPE = os.environ.get("CURSOR2API_CLIENT_TYPE", "cli")
 CLIENT_TYPE_PREFIXES = {"sand/": "sand", "bot/": "sand", "grokbot/": "sand",
                         "cli/": "cli"}
 
+# The API caller owns tool execution by default. Cursor still needs its MCP
+# discovery control tool, but every executable tool exposed to the model must
+# be one of the caller definitions carried through McpTools.
+DEFAULT_TOOL_OWNER = os.environ.get("CURSOR2API_TOOL_OWNER", "caller")
+CALLER_TOOL_ALLOWLIST = ("mcp_tool_call", "get_mcp_tools_tool_call")
+
+
+def normalise_tool_owner(value):
+    aliases = {"client": "caller", "codex": "caller", "legacy": "cursor"}
+    raw = str(value or "caller").strip().lower()
+    owner = aliases.get(raw, raw)
+    if owner not in ("caller", "cursor"):
+        raise ValueError("CURSOR2API_TOOL_OWNER must be 'caller' or 'cursor'")
+    return owner
+
 
 def split_client_type(name, default=None):
     """`sand/claude-opus-5` -> ("sand", "claude-opus-5"); plain names pass through."""
@@ -58,22 +73,23 @@ def split_client_type(name, default=None):
 WS = os.environ.get("CURSOR_WS") or os.path.join(tempfile.gettempdir(), "cursor-sandbox")
 
 # ---- model registry -------------------------------------------------------
-# name -> parameters sent as RequestedModel.parameters
-MODEL_PARAMS = {
-    "claude-fable-5":  {"thinking": "true", "context": "300k", "effort": "high"},
-    "claude-opus-5":   {"thinking": "true", "context": "300k", "effort": "high"},
-    "claude-sonnet-5": {"thinking": "true", "context": "300k", "effort": "high"},
-    "composer-2.5":    {"fast": "true"},
-    "grok-4.6":        {"effort": "high", "fast": "true"},
-    "grok-4.5":        {"effort": "high", "fast": "true"},
-    "gpt-5.6-sol":     {"context": "272k", "reasoning": "medium", "fast": "false"},
-    "gpt-5.6-terra":   {"context": "272k", "reasoning": "medium", "fast": "false"},
-    "kimi-k3":         {"effort": "high"},
-}
+def default_params(name):
+    """Parameters for a model when the caller did not pick any.
+
+    The account's own catalog is the only trustworthy source: parameter ids
+    differ per family (claude/grok publish `effort`, gpt/kimi publish
+    `reasoning`) and Cursor rejects ids a model does not declare. A second
+    hand-written table here used to disagree with models.FALLBACK.
+    """
+    try:
+        from . import models
+        return dict(models.resolve(name, name)[1])
+    except Exception:
+        return {}
 
 
 def requested_model(name, params=None):
-    p = params if params is not None else MODEL_PARAMS.get(name, {})
+    p = params if params is not None else default_params(name)
     toks = [(1, 2, name.encode())]
     for k, v in p.items():
         toks.append((3, 2, msg(f1=k, f2=str(v))))
@@ -104,9 +120,9 @@ def _normalise(name):
     return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name).lower().replace("-", "_")
 
 
-# ExecServerMessage field -> the caller's tool that does the same job. Cursor always
-# offers the model its own file/shell tools and they cannot be turned off, so a
-# caller like Claude Code otherwise loses half of its tool calls to the sandbox.
+# ExecServerMessage field -> the caller's tool that does the same job. This is a
+# fallback for legacy cursor-owned sessions and protocol control messages; normal
+# API sessions filter model-visible Cursor tools before generation starts.
 BUILTIN_EQUIVALENT = {
     2: ("shell", "bash", "terminal", "run_command"),
     3: ("write", "write_file", "create_file", "edit"),
@@ -150,10 +166,14 @@ class Session:
 
     def __init__(self, model="claude-fable-5", system=None, tools=None,
                  web=True, workspace=False, model_params=None, debug=False,
-                 chat=False, client_type=None):
+                 chat=False, client_type=None, tool_owner=None):
         self.model, self.system, self.tools = model, system, tools or []
         self.client_type = client_type or CLIENT_TYPE
-        self.web, self.workspace, self.debug = web, workspace, debug
+        self.tool_owner = normalise_tool_owner(tool_owner or DEFAULT_TOOL_OWNER)
+        # Caller-owned sessions receive search/fetch through MCP just like every
+        # other function. The context flags are only meaningful in legacy mode.
+        self.web = web and self.tool_owner == "cursor"
+        self.workspace, self.debug = workspace, debug
         # Plain chat: no caller tools and no attachments, so nothing the agent's
         # builtin file/shell tools could do is of any use to the caller.
         self.chat = chat
@@ -162,11 +182,26 @@ class Session:
         self.rid = str(uuid.uuid4())
         self.conn = None
         self.buf = b""
+        # Frames and the events they decode to live on the session, not in a
+        # local variable inside events(): a caller that stops mid-batch (Turn
+        # hands control back on a tool call) must not destroy the rest of the
+        # batch along with the abandoned generator.
+        self.pending_frames = []
+        self.pending_events = []
         self.usage = {}
         self.tool_by_name = {t["name"]: t for t in self.tools}
         self.wire_name = wire_names(self.tools)
         self.name_of_wire = {v: k for k, v in self.wire_name.items()}
         self.by_norm = {_normalise(t["name"]): t["name"] for t in self.tools}
+        # Same index without separators: models also spell `WebSearch` as
+        # `websearch`, which normalises to itself and misses by_norm.
+        self.by_flat = {k.replace("_", ""): v for k, v in self.by_norm.items()}
+        # In legacy cursor-owned mode, turn off a builtin web tool when the caller
+        # ships one with the same name. Caller-owned mode starts with both off.
+        self.builtin_web = {"web_search": self.web, "web_fetch": self.web}
+        for norm in self.by_norm:
+            if norm in self.builtin_web:
+                self.builtin_web[norm] = False
         self.blobs = {}                 # KV blob store the server writes through us
         self.last_activity = None      # last frame carrying interaction/exec content
         self.last_frame = None         # last server message of any kind, heartbeats too
@@ -209,8 +244,10 @@ class Session:
                   f10="UTC", f11=WS, f12=WS + "/.transcripts")
         ctx = {"f4": env}
         if self.web:
-            ctx["f17"] = True   # web_search_enabled
-            ctx["f24"] = True   # web_fetch_enabled
+            if self.builtin_web["web_search"]:
+                ctx["f17"] = True   # web_search_enabled
+            if self.builtin_web["web_fetch"]:
+                ctx["f24"] = True   # web_fetch_enabled
         inner = {"f10": msg(f1=msg(f1=msg(**ctx)))}
         if eid:
             inner["f1"] = eid
@@ -237,6 +274,9 @@ class Session:
         }
         if self.client_type == "sand":
             headers["x-sand-box-namespace"] = "prod"
+        if self.tool_owner == "caller":
+            headers["x-cursor-agent-allowed-tools"] = ",".join(
+                CALLER_TOOL_ALLOWLIST)
         self.attached = bool(images or documents)
         self.conn = h2stream.acquire(HOST)
         self.conn.start(PATH, headers)
@@ -292,6 +332,12 @@ class Session:
         else:
             self.last_frame = None
         while time.time() - t0 < hard_timeout:
+            if self.buffered():
+                for ev in self._drain():
+                    yield ev
+                    if ev[0] in ("end", "error"):
+                        return
+                continue
             try:
                 kind, val = self.conn.events.get(timeout=0.5)
             except Exception:
@@ -319,32 +365,60 @@ class Session:
                     yield "error", f"HTTP {val.get(':status')}"
                     return
                 continue
-            if kind in ("end", "closed", "error"):
+            if kind == "end":
                 yield "end", kind
                 return
+            if kind in ("closed", "error"):
+                # A reset, a GOAWAY or a dead socket is a truncated turn, not a
+                # finished one. Sharing the "end" path meant the caller saw
+                # HTTP 200 with whatever half answer had arrived.
+                yield "error", "upstream stream %s: %s" % (kind, val)
+                return
             frames, self.buf = deframe(self.buf + val)
-            for flag, payload in frames:
-                if flag & 0x02:
-                    j = payload.decode("utf-8", "replace")
-                    if '"error"' in j:
-                        yield "error", j[:600]
-                    yield "end", "trailer"
-                    return
-                for ev in self._handle(payload):
-                    if not self.first_output and (
-                            ev[0] in ("text", "thinking", "tool_use", "web", "dbg")
-                            or self.turn_ended):
-                        self.first_output = True
-                        self.last_activity = time.time()
-                    yield ev
-                if self.turn_ended:
-                    yield "end", "turn_ended"
-                    return
-            if self._idle_over(idle_stop):
+            self.pending_frames.extend(frames)
+            if self._idle_over(idle_stop) and not self.buffered():
                 yield "end", "idle"
                 return
         self.close()
         yield "error", f"turn exceeded hard timeout of {int(hard_timeout)}s"
+
+    def buffered(self):
+        """True while frames from an already-received batch are still queued."""
+        return bool(self.pending_events or self.pending_frames)
+
+    def _drain(self):
+        """Yields the events of already-received frames, one buffered item at a time.
+
+        Everything stays on the session between yields, so abandoning this
+        generator (which is what handing a tool call back to the API caller
+        does) only pauses the batch instead of dropping it.
+        """
+        while self.buffered():
+            while self.pending_events:
+                ev = self.pending_events.pop(0)
+                if not self.first_output and (
+                        ev[0] in ("text", "thinking", "tool_use", "web", "dbg")
+                        or self.turn_ended):
+                    self.first_output = True
+                    self.last_activity = time.time()
+                yield ev
+            if self.turn_ended:
+                yield "end", "turn_ended"
+                return
+            if not self.pending_frames:
+                return
+            flag, payload = self.pending_frames.pop(0)
+            if flag & 0x02:
+                err = _trailer_error(payload.decode("utf-8", "replace"))
+                yield ("error", err) if err else ("end", "trailer")
+                return
+            try:
+                self.pending_events = list(self._handle(payload))
+            except Exception as e:
+                # One undecodable frame must not abort the turn and leak the
+                # stream; the rest of the batch is still worth reading.
+                self.pending_events = ([("dbg", "undecodable frame: %r" % (e,))]
+                                       if self.debug else [])
 
     def _redirect(self, field):
         """Text refusing a builtin tool in favour of the caller's own tools.
@@ -369,9 +443,23 @@ class Session:
         return ("This tool is not connected to the user's machine. Use the provided "
                 "tools (%s) instead." % ", ".join(sorted(self.wire_name.values())[:20]))
 
+    def _reply_exec(self, replies, eid, esid):
+        """Send ExecClientMessage replies tagged with the exec id they answer."""
+        for rf, payload in replies:
+            inner = {"f%d" % rf: payload}
+            if eid:
+                inner["f1"] = eid
+            if esid:
+                inner["f15"] = esid
+            self._send(msg(f2=msg(**inner)))
+        if any(rf == 14 for rf, _ in replies) and eid:
+            # streamed execs must be closed: ExecClientControlMessage.stream_close
+            self._send(msg(f5=msg(f1=msg(f1=eid))))
+
     def _builtin_tool(self, fields, ex, eid, esid, out):
         """Answer the agent's builtin file/shell tools from the sandbox."""
-        for fn in sorted(fields - {1, 15, 19, 55}):
+        candidates = sorted(fields - {1, 15, 19, 55})
+        for fn in candidates:
             a = get(ex, fn)
             if a is None:
                 continue
@@ -383,19 +471,37 @@ class Session:
                 # An unanswered ExecServerMessage stalls the stream for good, so an
                 # unsupported builtin tool is refused rather than ignored.
                 done = [sandbox.refuse(fn, "this tool is not available here")]
-            for rf, payload in done:
-                inner = {"f%d" % rf: payload}
-                if eid:
-                    inner["f1"] = eid
-                if esid:
-                    inner["f15"] = esid
-                self._send(msg(f2=msg(**inner)))
-            if any(rf == 14 for rf, _ in done) and eid:
-                # streamed execs must be closed: ExecClientControlMessage.stream_close
-                self._send(msg(f5=msg(f1=msg(f1=eid))))
+            self._reply_exec(done, eid, esid)
             if self.debug:
                 out.append(("dbg", f"sandbox answered f{fn}"))
             return
+        if candidates:
+            # A request we cannot even name still has to be answered, or the
+            # agent waits on it forever and the turn dies at idle_stop.
+            self._reply_exec([sandbox.refuse(candidates[0],
+                                             "this tool is not available here")],
+                             eid, esid)
+            if self.debug:
+                out.append(("dbg", f"refused unhandled exec {candidates}"))
+
+    def _caller_name(self, name):
+        """Wire tool name -> the caller's own name for it.
+
+        Exact wire names are the common case. Models also paraphrase the name:
+        they drop the collision suffix, or fall back to Cursor's builtin spelling
+        (`WebSearch_` -> `web_search`). Matching on the normalised form recovers
+        those instead of handing the caller a tool it never declared.
+        """
+        if name in self.name_of_wire:
+            return self.name_of_wire[name]
+        if name in self.tool_by_name:
+            return name
+        for cand in (name, name.rstrip("_")):
+            norm = _normalise(cand)
+            hit = self.by_norm.get(norm) or self.by_flat.get(norm.replace("_", ""))
+            if hit:
+                return hit
+        return name
 
     def _idle_over(self, idle_stop):
         """True when nothing at all has arrived for `idle_stop` seconds."""
@@ -461,7 +567,7 @@ class Session:
                 self.last_activity = time.time()
                 a = get(ex, 11)
                 name = (get(a, 5) or get(a, 1) or b"").decode()
-                name = self.name_of_wire.get(name, name)
+                name = self._caller_name(name)
                 tcid = (get(a, 3) or b"").decode()
                 args = {}
                 for kv in getall(a, 2):
@@ -471,16 +577,12 @@ class Session:
                 out.append(("tool_use", {"id": tcid or "toolu_" + uuid.uuid4().hex[:16],
                                          "name": name, "input": args,
                                          "exec": (eid or None, esid)}))
-            key = next((k for k in (41, 42, 43) if k in fields), None)
-            if key:                           # allowlist precheck -> allowlisted
-                inner = {"f%d" % key: msg(f1=True)}
-                if eid:
-                    inner["f1"] = eid
-                if esid:
-                    inner["f15"] = esid
-                self._send(msg(f2=msg(**inner)))
             else:
-                self._builtin_tool(fields, ex, eid, esid, out)
+                key = next((k for k in (41, 42, 43) if k in fields), None)
+                if key:                       # allowlist precheck -> allowlisted
+                    self._reply_exec([(key, msg(f1=True))], eid, esid)
+                else:
+                    self._builtin_tool(fields, ex, eid, esid, out)
             return out
         kv = get(sm, 4)
         if kv is not None:
@@ -513,6 +615,26 @@ class Session:
         return out
 
 
+def _trailer_error(text):
+    """Connect end-of-stream trailer -> error text, or None for a clean end.
+
+    The trailer is JSON: {} on success, {"error":{"code":..,"message":..}}
+    otherwise. Matching on the substring '"error"' also fired on payloads that
+    merely mentioned the word, and it threw away the code the caller needs.
+    """
+    try:
+        obj = json.loads(text or "{}")
+    except ValueError:
+        return text[:600] if '"error"' in (text or "") else None
+    err = obj.get("error") if isinstance(obj, dict) else None
+    if not err:
+        return None
+    if isinstance(err, dict):
+        detail = " ".join(str(err.get(k)) for k in ("code", "message") if err.get(k))
+        return (detail or json.dumps(err, ensure_ascii=False))[:600]
+    return str(err)[:600]
+
+
 def _web_search(tool_call):
     """ToolCall.web_search (f18) -> {'id', 'query', 'results': [{title,url,text}]}.
 
@@ -528,15 +650,43 @@ def _web_search(tool_call):
     res = get(get(ws, 2) or b"", 1)
     if res is None:
         return None
-    hits = []
+    hits, seen, summary = [], set(), ""
     for ref in getall(res, 1):
         url = (get(ref, 2) or b"").decode("utf-8", "replace")
+        text = (get(ref, 3) or b"").decode("utf-8", "replace")
         if not url:
-            continue                        # first entry is the aggregated summary
-        hits.append({"title": (get(ref, 1) or b"").decode("utf-8", "replace"),
-                     "url": url,
-                     "text": (get(ref, 3) or b"").decode("utf-8", "replace")})
-    return {"id": tcid, "query": query, "results": hits}
+            # The url-less first entry is the aggregated summary and often the
+            # only entry Cursor sends. Dropping it turned a search that did find
+            # pages into an empty result list.
+            summary = summary or text
+            continue
+        seen.add(url)
+        hits.append({"title": (get(ref, 1) or b"").decode("utf-8", "replace") or url,
+                     "url": url, "text": _readable(text)})
+    for title, url in _summary_links(summary):
+        if url not in seen:
+            seen.add(url)
+            hits.append({"title": title, "url": url, "text": ""})
+    return {"id": tcid, "query": query, "results": hits, "summary": summary}
+
+
+_SANDBOX_TEXT = re.compile(r"^Full page text written to file: .*", re.S)
+_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
+def _readable(text):
+    """Drop per-result bodies that only point at Cursor's own sandbox files.
+
+    Cursor spools fetched pages into /tmp paths inside its agent sandbox, which
+    the caller cannot open; passing that string through only invites the model to
+    try reading a file that does not exist on this machine.
+    """
+    return "" if _SANDBOX_TEXT.match(text or "") else text
+
+
+def _summary_links(summary):
+    """Markdown links in the aggregated summary -> [(title, url)]."""
+    return [(m.group(1), m.group(2)) for m in _LINK.finditer(summary or "")]
 
 
 def _mcp_value(v):
@@ -555,7 +705,10 @@ def _mcp_value(v):
             return None                              # null_value
         if fn == 2 and wt == 1:
             import struct
-            return struct.unpack("<d", val)[0]       # number_value
+            f = struct.unpack("<d", val)[0]          # number_value
+            # protobuf JSON-mapping demands ints for integer-typed fields and
+            # rejecting "10000.0" where u64 is expected; keep true fractions.
+            return int(f) if f.is_integer() else f
         if fn == 3 and wt == 2:
             return val.decode("utf-8", "replace")    # string_value
         if fn == 4 and wt == 0:
