@@ -36,6 +36,10 @@ local/upstream failure instead of a structured field-level error.
 | `GET` | `/login` | Start or inspect background browser authorization | Not checked |
 | `HEAD` | any path | Client base-URL probe | Not checked |
 
+No other vendor endpoints are implemented. In particular, the server does not
+provide the OpenAI Responses, legacy Completions, Embeddings, Images, Audio, or
+Assistants APIs, or Anthropic administrative/batch APIs.
+
 ## Anthropic-style Messages
 
 ### `POST /v1/messages`

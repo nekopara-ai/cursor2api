@@ -166,6 +166,22 @@ The following paths reach the same OpenAI-style handler:
 - `/chat/completions`
 - `/openai/v1/chat/completions`
 
+## Configure an existing client
+
+For clients that support vendor base-URL overrides, point them at the local
+listener and use the configured local `API_KEY` as the client key:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_API_KEY=local-development-key
+
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export OPENAI_API_KEY=local-development-key
+```
+
+Client libraries vary in which endpoints and optional fields they call. Consult
+[API reference](api-reference.md) before assuming a client is fully compatible.
+
 ## Use the one-shot raw CLI
 
 The `chat` command calls the upstream protocol directly instead of going through
