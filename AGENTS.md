@@ -1,81 +1,132 @@
-# Agent instructions
+# Repository guide for coding agents
 
-This file is for coding agents (Cursor, Claude Code, Codex, Copilot, etc.)
-working in this repository. Humans should read [README.md](README.md) first.
+This is the canonical instruction file for automated coding assistants working in
+the repository. Human contributors should begin with [README.md](README.md) and
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-## What this repo is
+## Mission and boundaries
 
-An unofficial Python proxy: Anthropic `/v1/messages` + OpenAI `/v1/chat/completions`
-in front of Cursor's private bidirectional Connect RPC
-`agent.v1.AgentService/Run` on `agentn.global.api5.cursor.sh`.
+`cursor2api` is an experimental local gateway from selected Anthropic Messages and
+OpenAI Chat Completions shapes to Cursor's private bidirectional agent protocol.
 
-## Non-negotiables
+Preserve these boundaries in code and documentation:
 
-- **Never commit secrets.** No `credentials.json`, `.env`, cookies, JWTs,
-  `crsr_` keys, proxy passwords, account emails, user ids, or server logs.
-  Tokens live in `~/.config/cursor2api/` (0600) or env vars. `.env.example` stays
-  commented placeholders only.
-- **Do not bind `0.0.0.0` in examples or defaults.** Default is `127.0.0.1`.
-- **Do not add exploit PoCs, malware, or account-farming / token-pool code.**
-  This project is a personal-account proxy, not a marketplace.
-- **Do not rewrite git history** unless the user explicitly asks.
-- Keep the MIT license in [LICENSE](LICENSE).
+- do not claim complete Anthropic or OpenAI compatibility;
+- do not describe the private upstream protocol as stable or supported;
+- do not present usage estimates as tokenizer-exact or billing-authoritative;
+- do not present client-identity routing as entitlement, quota bypass, or an xAI
+  API integration;
+- do not present `sandbox.py` as OS-level isolation; and
+- do not make the built-in listener appear safe for public or multi-tenant use.
 
-## Layout
+## Non-negotiable safety rules
 
-| path | role |
+- Never commit credentials, tokens, cookies, API keys, account identifiers, proxy
+  passwords, proprietary bundles, packet captures, runtime logs, or local auth
+  files.
+- Keep examples bound to `127.0.0.1`; do not introduce `0.0.0.0` as a default or
+  copy-paste quick start.
+- Do not add credential harvesting, account farming, marketplaces, quota evasion,
+  exploit tooling, malware, or unauthorized access features.
+- Do not enable `SANDBOX_SHELL` by default.
+- Do not rewrite Git history, force-push, delete refs, publish a release, or change
+  repository visibility unless the user explicitly authorizes that operation.
+- Preserve the MIT license and third-party rights.
+
+## Read before editing
+
+Use the smallest relevant set:
+
+- [API reference](docs/api-reference.md) for downstream behavior;
+- [Configuration](docs/configuration.md) for environment variables and defaults;
+- [Architecture](docs/architecture.md) for component and state boundaries;
+- [Operations](docs/operations.md) for deployment and failure semantics;
+- [Protocol notes](docs/protocol.md) for upstream framing and fields;
+- [Experimental client identity routing](docs/usage-pools.md) for prefixes; and
+- [SECURITY.md](SECURITY.md) for security-sensitive work.
+
+## Repository map
+
+| Path | Responsibility |
 |---|---|
-| `cursor2api/server.py` | HTTP facade, live tool sessions, usage estimates |
-| `cursor2api/session.py` | Run RPC, protobuf, `x-cursor-client-type` |
-| `cursor2api/h2stream.py` | HTTP/2 + optional HTTP CONNECT |
-| `cursor2api/auth.py` | API-key exchange / PKCE / CLI auth file |
-| `cursor2api/models.py` | `AvailableModels` catalog and aliases |
-| `cursor2api/openai_api.py` | OpenAI request/response mapping |
-| `cursor2api/pb.py` | tiny protobuf encode/decode |
-| `cursor2api/sandbox.py` | local answers to Cursor builtin file/shell tools |
-| `docs/protocol.md` | wire format and field numbers |
-| `docs/usage-pools.md` | `cli` vs `sand` metering |
-| `tests/` | live HTTP tests (need a running server + account) |
+| `cursor2api/server.py` | HTTP facade, local auth, live tool sessions, usage, logs |
+| `cursor2api/openai_api.py` | OpenAI Chat Completions conversion |
+| `cursor2api/session.py` | Run request, protobuf messages, tools, upstream events |
+| `cursor2api/h2stream.py` | TLS/HTTP/2 transport and CONNECT proxy |
+| `cursor2api/auth.py` | Credential precedence, exchange, browser login, storage |
+| `cursor2api/models.py` | Catalog, variants, aliases, fallback, resolution |
+| `cursor2api/pb.py` | Minimal protobuf and Connect framing helpers |
+| `cursor2api/sandbox.py` | Compatibility replies for selected builtin operations |
+| `cursor2api/__main__.py` | CLI entry point |
+| `tests/` | Offline unit regressions and live integration scripts |
 
-## Protocol constraints you must not "simplify"
+## Protocol invariants
 
-1. **Run is bidi-streaming HTTP/2.** A buffered client that sends the whole body
-   and half-closes only ever sees heartbeats. Keep `h2stream.py`.
-2. **`x-cursor-client-version` must be a CLI build id**
-   (`cli-YYYY.MM.DD-……`). Putting Grok Bot's `0.18.0` on this stream is
-   `permission_denied`. Version validates the *transport*; `x-cursor-client-type`
-   selects the *meter*.
-3. **Usage pool = `x-cursor-client-type`.** `cli` → plan included/bonus.
-   `sand` → Grok Bot weekly pool. Same access token. See
-   `split_client_type()` in `session.py`.
-4. **Parked live sessions must match both `model` and `client_type`.** Mixing
-   pools on one Run stream is wrong.
-5. Cursor injects a large agent harness; you cannot turn it off
-   (`custom_system_prompt` / `exclude_workspace_context` are refused).
-6. Field numbers in `session.py` / `docs/protocol.md` come from a specific CLI
-   bundle. Bump `CURSOR_CLI_VERSION` only together with a protocol re-read.
+Do not simplify these without equivalent evidence and regression coverage:
 
-## When changing behaviour
+1. `AgentService/Run` is bidirectional HTTP/2. The request side must remain open
+   for context, exec, KV, interaction, and tool-result messages.
+2. Connect messages use a flags byte, a four-byte length, and a protobuf or trailer
+   payload. Reset, GOAWAY, socket failure, and error trailers are not clean ends.
+3. Already-decoded frames must remain on the `Session`. Returning one tool call to
+   the API caller must not discard later parallel calls from the same H2 batch.
+4. Nested MCP values must recursively preserve structs, lists, booleans, nulls,
+   strings, and integral numbers.
+5. Parked parallel tool sessions resume only with the exact complete result set,
+   same model, and same client identity.
+6. `CURSOR_CLI_VERSION` is part of the upstream wire contract. Do not bump it
+   without re-reading and validating the protocol.
+7. Unknown executable exec messages need a reply or refusal; silently ignoring one
+   can stall the upstream stream.
+8. Once downstream streaming headers are sent, failures belong in the SSE body;
+   never write a second HTTP status line.
 
-- Keep public HTTP shapes (Anthropic + OpenAI) stable unless the README is
-  updated in the same change.
-- New env vars go in `.env.example` and the README configuration table.
-- After touching `session.py` / `server.py` / `h2stream.py`, import checks
-  belong in `cursor2api.session` (`split_client_type`), and a localhost
-  `/v1/messages` call if credentials are available.
-- Do not add network calls to xAI `api.x.ai` for Grok Bot. That is a different
-  product and a different wallet. Sand metering stays on Cursor's aiserver.
+## Change requirements
 
-## Style
+- Public route or request/response change: update `docs/api-reference.md`.
+- Environment variable or default change: update `docs/configuration.md` and
+  `.env.example`.
+- Deployment, authentication, logging, health, or timeout change: update
+  `docs/operations.md` and `SECURITY.md` when relevant.
+- Protocol field/header change: update `docs/protocol.md` with evidence and
+  version context.
+- Project-level capability or risk change: keep `README.md` and
+  `README.zh-CN.md` structurally aligned.
+- New dependency: explain why the standard library and current dependency are
+  insufficient, and review maintenance/security impact before adding it.
 
-- Python 3.9+, stdlib + `h2` only unless a dependency is discussed first.
-- Match the existing compact style in `server.py` / `session.py`; do not
-  reformat the whole file in an unrelated PR.
-- Comments in English. User-facing README keeps both English and Chinese.
+Do not copy volatile account-plan, pricing, quota, or date-specific claims into
+the documentation. Link users to official account surfaces for those facts.
 
-## What not to "fix"
+## Verification
 
-- Empty Anthropic thinking `signature` — Cursor does not send one.
-- Harness-inflated `input_tokens` — that is Cursor, not a leak in this proxy.
-- Builtin Cursor tools colliding with client tools — already remapped via
-  `wire_names` / `BUILTIN_TOOLS`.
+Run offline tests after every code change:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python tests/test_timeouts_offline.py
+git diff --check
+```
+
+For import-sensitive changes:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -c \
+  'import cursor2api.auth, cursor2api.h2stream, cursor2api.models, cursor2api.server, cursor2api.session'
+```
+
+Live tests are optional and must be reported separately. They require explicit
+credentials, network access, and account capacity. Use only an authorized personal
+test account, keep probes small, and state the model, identity prefix, and untested
+paths. Do not restart or modify an existing production process merely to validate
+a repository edit unless the user authorizes that operational change.
+
+## Working-tree hygiene
+
+- Inspect `git status --short` before editing and preserve unrelated user changes.
+- Keep scratch scripts, captures, logs, and generated reports outside the project
+  tree.
+- Do not add broad ignore rules to hide agent artifacts.
+- Remove agent-created caches before handoff and ensure every new repository file
+  is an intended deliverable.
+- Review the final diff for secrets and misleading compatibility claims.

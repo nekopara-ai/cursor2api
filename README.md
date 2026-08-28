@@ -1,263 +1,174 @@
 # cursor2api
 
-[中文说明](README.zh-CN.md)
+[简体中文](README.zh-CN.md)
 
-Use the models on a signed-in Cursor account through the Anthropic Messages API
-and the OpenAI Chat Completions API.
+`cursor2api` is an experimental local gateway that presents selected parts of
+the Anthropic Messages API and OpenAI Chat Completions API in front of a signed-in
+Cursor account.
 
-An unofficial proxy in front of Cursor's agent protocol, with HTTP CONNECT
-egress, usage estimates for unfinished tool turns, live tool-call session
-resume, and a **Grok Bot (`sand`) usage-pool switch**.
+> [!WARNING]
+> This is an independent, unofficial project. It is not affiliated with or
+> endorsed by Cursor (Anysphere), Anthropic, OpenAI, xAI, or any model provider.
+> It depends on a private, undocumented, version-sensitive upstream protocol and
+> may stop working without notice. Review the applicable terms for your account
+> before using it.
 
-- `POST /v1/messages` and `POST /v1/chat/completions`, streaming or buffered
-- every model the signed-in account can use, listed by `GET /v1/models`
-- tools, images, PDFs, thinking/reasoning, usage
-- authorise with a Cursor API key or a browser login
-- optional `sand/` / `bot/` model prefix to draw on the Grok Bot weekly pool
+The project is intended for local development, interoperability experiments,
+and protocol research. It is not a drop-in implementation of either vendor API,
+and it should not be operated as a public or multi-tenant service.
 
-## Disclaimer
+## What it provides
 
-This project is an independent, unofficial and experimental tool. It is not
-affiliated with, endorsed by or supported by Cursor (Anysphere), Anthropic,
-OpenAI or xAI. Product names are used only to describe wire formats.
+- Anthropic-style `POST /v1/messages`, including streaming, tools, images,
+  documents, and reasoning summaries.
+- OpenAI-style `POST /v1/chat/completions`, including streaming and function
+  calling.
+- Account-scoped model discovery through `GET /v1/models`.
+- Cursor API-key exchange, browser login, and optional reuse of Cursor CLI
+  credentials.
+- A bidirectional HTTP/2 transport for Cursor's agent stream, with optional
+  HTTP CONNECT egress.
+- Live continuation of tool-call turns when the complete matching tool-result
+  set is returned promptly.
+- Experimental per-request client-identity routing through model-name prefixes.
 
-It talks to a **private, undocumented, version-gated protocol**. Cursor can
-change the protocol, tighten client-identity checks, or suspend accounts at any
-time. Using it may conflict with Cursor's terms of service and with the terms of
-the model providers behind it. You are responsible for how you use it and for
-your own account. No warranty of any kind: see [LICENSE](LICENSE).
+## Project boundaries
 
-**Do not expose this proxy to the public internet.** Bind to localhost, set
-`API_KEY`, and never commit credentials.
+| Area | Status | Important boundary |
+|---|---|---|
+| Anthropic Messages | Supported subset | Common message, content, tool, and SSE shapes are translated; this is not full API compatibility. |
+| OpenAI Chat Completions | Supported subset | Common chat and function-calling shapes are translated through the Anthropic-style internal representation. |
+| `max_tokens` and stop sequences | Approximated | Enforced locally using text matching and an approximate four-characters-per-token cap. |
+| Token counts and usage | Approximated | Counts may be estimated or clamped because Cursor does not expose equivalent per-request counters for every tool turn. |
+| Sampling and response controls | Accepted with no equivalent behavior | Parameters such as `temperature`, `top_p`, `seed`, penalties, `n`, and `response_format` are not forwarded to an equivalent upstream control. |
+| Model aliases | Best effort | Unknown model names fall back to `DEFAULT_MODEL` instead of returning a validation error. |
+| Client-identity prefixes | Experimental | `sand/`, `bot/`, `grokbot/`, and `cli/` change the announced client type; upstream acceptance is not guaranteed. |
+| Upstream protocol | Unstable | Field numbers and required headers can change with Cursor releases. |
 
-## Install
+See [API reference](docs/api-reference.md) for the exact request and response
+behavior.
+
+## Quick start
+
+Requirements: Python 3.9 or newer, network access to Cursor, and a Cursor account
+you are authorized to use.
 
 ```bash
 git clone https://github.com/nekopara-ai/cursor2api.git
 cd cursor2api
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -e .
 ```
 
-Python 3.9+ and the `h2` package.
-
-## Authorise
-
-Pick one:
+Choose an upstream credential source:
 
 ```bash
-# 1. API key from https://cursor.com/dashboard
-export CURSOR_API_KEY=crsr_...
+# Option A: a Cursor API key
+export CURSOR_API_KEY='crsr_...'
 
-# 2. Browser PKCE login (writes ~/.config/cursor2api/credentials.json, mode 0600)
+# Option B: browser authorization stored under ~/.config/cursor2api/
 python -m cursor2api login
-
-# 3. Reuse a Cursor CLI session (~/.config/cursor/auth.json)
-#    enabled by default via CURSOR2API_USE_CLI_AUTH=1
 ```
 
-`serve` can also start a login itself: with no credentials it prints an
-authorisation URL. A background server answers `GET /login` with that URL and
-picks up the approval on its own.
+Start a localhost-only server and protect POST requests with a local key:
 
 ```bash
-python -m cursor2api status    # which credential source is in use
-python -m cursor2api logout    # delete the stored file
+export API_KEY='local-development-key'
+python -m cursor2api serve
 ```
 
-## Use
+The service listens on `http://127.0.0.1:8787` by default. The repository's
+[`.env.example`](.env.example) is a reference template only: the application
+does **not** load `.env` files automatically. Export variables in the process
+environment or load them with your process manager before starting the server.
+
+List the currently available model IDs:
 
 ```bash
-python -m cursor2api serve            # http://127.0.0.1:8787
+curl -s http://127.0.0.1:8787/v1/models
 ```
 
-Anthropic clients, Claude Code included:
+`GET` and `HEAD` routes are currently not protected by `API_KEY`; keep the
+listener on a trusted interface even when a local API key is configured.
+
+## Send a request
+
+Anthropic Messages:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-export ANTHROPIC_API_KEY=sk-local
-
-curl -s localhost:8787/v1/messages -H 'content-type: application/json' -d '{
-  "model": "claude-sonnet-4-5", "max_tokens": 256,
-  "messages": [{"role": "user", "content": "hello"}]}'
+curl http://127.0.0.1:8787/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: local-development-key' \
+  -d '{
+    "model": "claude-fable-5",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
 ```
 
-OpenAI clients, same port:
+OpenAI Chat Completions:
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
-export OPENAI_API_KEY=sk-local
-
-curl -s localhost:8787/v1/chat/completions -H 'content-type: application/json' -d '{
-  "model": "gpt-5.6-sol", "stream": true,
-  "messages": [{"role": "user", "content": "hello"}]}'
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer local-development-key' \
+  -d '{
+    "model": "claude-fable-5",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
 ```
 
-Routes: `POST /v1/messages`, `POST /v1/messages/count_tokens`,
-`POST /v1/chat/completions`, `GET /v1/models`, `GET /v1/models/{id}`,
-`GET /login`, `GET /health`.
+Replace the example model with an ID returned by `/v1/models`. A successful
+catalog response does not prove that a particular model invocation will be
+authorized, and the endpoint may return a built-in fallback catalog when the
+upstream catalog request fails.
 
-## Usage pools: `cli` vs `sand` (Grok Bot)
+## Documentation
 
-Cursor meters usage from the **announced client identity**, not from the model
-id and not from which hostname you hit.
-
-| `x-cursor-client-type` | What it is | Meter |
-|---|---|---|
-| `cli` (default) | Cursor CLI / this proxy's original identity | Plan included + bonus pool |
-| `sand` | Grok Bot desktop (`com.anysphere.sand`) | Independent Grok Bot weekly pool |
-
-Same Cursor access token, same `agent.v1.AgentService/Run` stream. Only the
-client-type header changes.
-
-Prefix the model name **per request**:
-
-```bash
-# Plan pool (default)
-{"model": "claude-opus-5", ...}
-
-# Grok Bot weekly pool — works even when the plan API pool is exhausted
-{"model": "sand/claude-opus-5", ...}
-{"model": "bot/gpt-5.2", ...}
-{"model": "grokbot/composer-2.5", ...}
-
-# Force the plan pool even if CURSOR2API_CLIENT_TYPE=sand
-{"model": "cli/grok-4.6", ...}
-```
-
-Or set a process-wide default:
-
-```bash
-export CURSOR2API_CLIENT_TYPE=sand
-```
-
-**Hard constraint:** `x-cursor-client-version` must remain a **Cursor CLI**
-build id (default `cli-2026.08.11-e8db854`, override with `CURSOR_CLI_VERSION`).
-Sending Grok Bot's desktop version (`0.18.0`) on this stream returns
-`permission_denied`. The server uses the version header to validate the
-transport, and the client-type header to pick the meter.
-
-Grok Bot access (as of 2026-08-26) is granted to Cursor Pro / Pro+ / Ultra and
-matching SuperGrok plans. Check your own account:
-
-```bash
-# empty JSON body, Connect + JSON
-curl -s -X POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandAccessStatus \
-  -H "authorization: Bearer $CURSOR_ACCESS_TOKEN" \
-  -H "content-type: application/json" \
-  -H "connect-protocol-version: 1" \
-  -H "x-cursor-client-type: sand" \
-  -d '{}'
-
-curl -s -X POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus \
-  -H "authorization: Bearer $CURSOR_ACCESS_TOKEN" \
-  -H "content-type: application/json" \
-  -H "connect-protocol-version: 1" \
-  -H "x-cursor-client-type: sand" \
-  -d '{}'
-```
-
-`GetSandAccessStatus` should report `SAND_ACCESS_STATE_GRANTED`.
-`GetSandUsageStatus` reports `usagePercent`, `nextResetTimestampUtc` (weekly)
-and `grokPlanLabel`. On-demand billing may be eligible after the included pool
-is empty — check the Cursor spending dashboard before you rely on this.
-
-This is unofficial client-identity switching. If Cursor starts tying `sand` to a
-real machine checksum or to a matching desktop version, the prefix will stop
-working.
-
-Details: [docs/usage-pools.md](docs/usage-pools.md).
-
-## Models
-
-`GET /v1/models` returns the account's own catalog. Any of these spellings works
-as `model`:
-
-| form | example |
+| Document | Purpose |
 |---|---|
-| base model | `claude-fable-5`, `gpt-5.6-sol`, `gemini-3.1-pro`, `kimi-k3` |
-| Cursor variant | `claude-fable-5-thinking-xhigh`, `composer-2.5-fast` |
-| alias | `fable`, `sonnet-latest`, `opus`, `codex` |
-| explicit parameters | `claude-sonnet-5[thinking=false,effort=max]` |
-| another vendor's id | `claude-3-5-sonnet-20241022`, `gpt-4o` (mapped to the nearest model) |
-| usage-pool prefix | `sand/claude-opus-5`, `bot/grok-4.6`, `cli/composer-2.5` |
+| [Getting started](docs/getting-started.md) | Installation, authentication, CLI commands, and first requests |
+| [Configuration](docs/configuration.md) | Complete environment-variable reference and credential precedence |
+| [API reference](docs/api-reference.md) | Routes, supported request shapes, streaming, errors, and compatibility limits |
+| [Architecture](docs/architecture.md) | Components, request flow, tools, live sessions, and trust boundaries |
+| [Operations](docs/operations.md) | Deployment posture, health semantics, logging, timeouts, and troubleshooting |
+| [Protocol notes](docs/protocol.md) | Version-sensitive Connect/protobuf transport notes |
+| [Experimental client identity routing](docs/usage-pools.md) | `cli` and `sand` request routing behavior and risks |
+| [Contributing](CONTRIBUTING.md) | Development workflow and pull-request expectations |
+| [Security policy](SECURITY.md) | Private reporting and deployment security guidance |
 
-Unknown ids fall back to `DEFAULT_MODEL`.
+## Security posture
 
-## Configuration
+- Keep the default `BIND=127.0.0.1`; the server does not provide TLS.
+- Set `API_KEY` for POST routes, but do not treat it as protection for GET or
+  HEAD routes.
+- Treat `/health` as a process-liveness response only. It does not verify
+  credentials, the model catalog, or the upstream inference path.
+- Keep credentials outside the repository. The default browser-login store is
+  `~/.config/cursor2api/credentials.json` with mode `0600`.
+- Do not enable `SANDBOX_SHELL=1` for untrusted traffic. The compatibility
+  sandbox is not an operating-system isolation boundary.
 
-See [.env.example](.env.example). Common variables:
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
-| variable | default | meaning |
-|---|---|---|
-| `BIND` / `PORT` | `127.0.0.1` / `8787` | listen address |
-| `API_KEY` | empty | require `x-api-key` / bearer from local clients |
-| `DEFAULT_MODEL` | `claude-fable-5` | fallback model |
-| `CURSOR_API_KEY` | — | `crsr_...` dashboard key |
-| `CURSOR2API_CREDENTIALS` | `~/.config/cursor2api/credentials.json` | OAuth store |
-| `CURSOR2API_CLIENT_TYPE` | `cli` | default usage pool |
-| `CURSOR_CLI_VERSION` | `cli-2026.08.11-e8db854` | `x-cursor-client-version` |
-| `CURSOR2API_PROXY` / `https_proxy` | — | HTTP CONNECT for the HTTP/2 stream |
-| `CURSOR2API_LIVE_TTL` | `150` | seconds a parked tool-call stream is kept |
-| `CURSOR2API_TOOL_OWNER` | `caller` | `caller` = only the caller's tools are exposed to the model; `cursor` = legacy builtin tools |
-| `CURSOR2API_WEB` | `1` | enable Cursor server-side web search/fetch |
-| `CURSOR2API_THINKING` | `auto` | when to request reasoning |
-| `CURSOR2API_SEND_TIMEOUT` | `120` | max seconds one h2 send waits on a closed flow-control window |
-| `CURSOR2API_LOG_TURNS` | `1` | one structured JSON line per turn on stderr |
-| `CURSOR2API_MAX_BODY` | `67108864` | request body size cap, bytes |
-| `MODEL_CACHE_FAIL_TTL` | `60` | seconds a failed catalog fetch is cached before another try |
-| `CURSOR2API_HTTP_IDLE` | `300` | idle timeout for one HTTP/1.1 connection into this server |
-| `IDLE_STOP` | `180` | safety net if the stream never closes |
-| `FIRST_TIMEOUT` | `90` | cut a turn that never gets a first frame |
-| `FIRST_OUTPUT_TIMEOUT` | `240` | cut a warm stream that never produces text/thinking/tool_use |
+## Development
 
-## Architecture (short)
-
-```
-client (Anthropic / OpenAI JSON)
-        │  HTTP/1.1  :8787
-        ▼
-cursor2api.server  ── live tool sessions (_live_sessions)
-        │  Connect+protobuf, HTTP/2
-        ▼
-agentn.global.api5.cursor.sh  /agent.v1.AgentService/Run
-```
-
-- `h2stream.py` — bidirectional HTTP/2 (the Run RPC blocks if the request is
-  half-closed). Optional HTTP CONNECT via `CURSOR2API_PROXY`.
-- `session.py` — protobuf field numbers, client-type header, tool/sandbox loop.
-- `server.py` — Anthropic + OpenAI facades, usage estimates when `turn_ended`
-  has not arrived yet, live resume of tool_use turns.
-- `auth.py` — API-key exchange or PKCE; tokens are never written into the repo.
-- `models.py` — `AvailableModels` catalog + aliases.
-
-Protocol field numbers: [docs/protocol.md](docs/protocol.md).
-
-## Notes and known limits
-
-- `temperature`, `top_p`, `top_k`, `cache_control`, `n`, `seed` and
-  `response_format` have no upstream equivalent and are ignored.
-- Thinking text is Cursor's summary; Anthropic `signature` is always `""`.
-- Web search is Cursor's own server-side tool (`server_tool_use` + titles/urls).
-- Each **new** session carries Cursor's agent harness (~12k–25k input tokens).
-  Live tool-session resume avoids replaying that harness on the next tool turn.
-- Tiny images (e.g. 16×16) may be rejected with 429; normal screenshots work.
-- Rate limits are the account's, returned as `429` + `retry-after`.
-- A model the account has not enabled answers `403 permission_error`.
-
-## Tests
-
-Start the server, then:
+Offline regression tests do not require a Cursor account:
 
 ```bash
-python tests/test_api.py
-python tests/test_openai.py
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python tests/test_timeouts_offline.py
 ```
 
-These hit a live Cursor account. They will fail if the plan pool is exhausted
-unless you point `MODEL` at a `sand/...` id that your account can use.
+`tests/test_api.py` and `tests/test_openai.py` are live integration scripts.
+They require a separately started server, usable credentials, network access,
+and account capacity. See [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a
+change.
 
-## License
+## License and trademarks
 
-MIT. See [LICENSE](LICENSE).
+The code is available under the [MIT License](LICENSE). Cursor, Anthropic,
+OpenAI, xAI, and related product names are trademarks of their respective
+owners and are used here only to identify interoperability targets.

@@ -1,66 +1,79 @@
-# Usage pools
+# Experimental client identity routing
 
-Cursor does not meter this proxy by model name. It meters by the client identity
-announced on the Run stream.
+`cursor2api` can change the upstream `x-cursor-client-type` header globally or for
+one request. This is an experimental interoperability feature, not a stable API or
+a promise about account quotas, billing, eligibility, or continued upstream
+acceptance.
 
-## Headers that matter
+> [!WARNING]
+> A client identity can affect how Cursor handles and meters a request. Use only
+> with an account you control, review the account's official usage and billing
+> settings, and assume that upstream validation can change without notice.
 
-On `POST https://agentn.global.api5.cursor.sh/agent.v1.AgentService/Run`:
+## Configuration
 
-| header | this proxy sends | selects |
+The process-wide default is:
+
+```bash
+export CURSOR2API_CLIENT_TYPE=cli
+```
+
+The model string can override it for one request:
+
+| Model string | Announced client type | Resolved model string |
 |---|---|---|
-| `x-cursor-client-type` | `cli` or `sand` | **which quota bucket** |
-| `x-cursor-client-version` | `CURSOR_CLI_VERSION` (a `cli-…` build) | **whether the stream is allowed** |
-| `x-sand-box-namespace` | `prod` only when type is `sand` | unused for metering in current tests |
-| `authorization` | Cursor access token | the account |
+| `claude-fable-5` | `CURSOR2API_CLIENT_TYPE` (default `cli`) | `claude-fable-5` |
+| `cli/claude-fable-5` | `cli` | `claude-fable-5` |
+| `sand/claude-fable-5` | `sand` | `claude-fable-5` |
+| `bot/claude-fable-5` | `sand` | `claude-fable-5` |
+| `grokbot/claude-fable-5` | `sand` | `claude-fable-5` |
 
-Isolating the headers showed:
+The prefix is removed before normal model resolution. It does not select an xAI
+API endpoint and does not turn a model into a different provider's API product.
 
-- `sand` without a namespace header still draws the Grok Bot pool
-- `cli` plus a namespace header still draws the plan pool and still 429s when
-  that pool is empty
-- replacing the version with Grok Bot desktop `0.18.0` returns
-  `permission_denied` even with `client-type: sand`
+## Headers sent upstream
 
-So: keep the CLI version, change only the type.
+For the Run stream, the relevant relationship is:
 
-## How the proxy exposes this
+| Header | Value |
+|---|---|
+| `authorization` | Access token for the Cursor account |
+| `x-cursor-client-type` | `cli` or `sand` |
+| `x-cursor-client-version` | `CURSOR_CLI_VERSION`, which remains a compatible Cursor CLI build ID |
+| `x-sand-box-namespace` | `prod` when the selected type is `sand` |
 
-`cursor2api.session.split_client_type()`:
+Changing the client type does not authorize an arbitrary client-version value.
+The proxy continues to speak the Cursor CLI form of `AgentService/Run`, so the
+version header must remain compatible with that transport.
 
-| model string | type | remaining model id |
-|---|---|---|
-| `claude-opus-5` | `CURSOR2API_CLIENT_TYPE` or `cli` | `claude-opus-5` |
-| `sand/claude-opus-5` | `sand` | `claude-opus-5` |
-| `bot/gpt-5.2` | `sand` | `gpt-5.2` |
-| `grokbot/composer-2.5` | `sand` | `composer-2.5` |
-| `cli/grok-4.6` | `cli` | `grok-4.6` |
+## Live tool-session rule
 
-Parked live tool sessions (`_live_sessions`) key on both model id and
-`client_type`, so a `sand/` turn cannot be resumed by a `cli/` follow-up.
+A parked tool stream retains the client identity with which it was opened. A
+tool-result follow-up can resume it only when the resolved model and client type
+both match and the complete tool-result set is returned. Changing from `cli/` to
+`sand/`, or the reverse, causes the fresh replay path.
 
-## Dashboard RPCs (read-only)
+## What this feature does not guarantee
 
-Same access token, Connect JSON, empty body, `api2.cursor.sh`:
+- It does not guarantee that the upstream accepts `sand` from this transport.
+- It does not guarantee that a model is available to the account.
+- It does not report or guarantee a quota bucket, reset schedule, included usage,
+  or on-demand billing behavior.
+- It does not implement the xAI API or use an xAI Console API key.
+- It does not reproduce the features of any desktop, mobile, cloud-agent, or
+  subscription product associated with a client identity.
+- It does not provide a way to bypass account authorization or provider policy.
 
-- `aiserver.v1.DashboardService/GetSandAccessStatus`
-  - `SAND_ACCESS_STATE_GRANTED` means the account may use Grok Bot
-  - `proAndSuperGrokPlansGrantAccess` reflects the 2026-08-26 plan expansion
-- `aiserver.v1.DashboardService/GetSandUsageStatus`
-  - `usagePercent`, `nextResetTimestampUtc`, `grokPlanLabel`
-  - independent of `GET https://cursor.com/api/usage-summary` (plan pool)
+Use official Cursor account surfaces as the authority for eligibility, usage, and
+billing. A request succeeding today is not evidence that this behavior is stable
+or supported.
 
-## What this is not
+## Compatibility risk
 
-- Not xAI `api.x.ai` (that wallet is a Console API key, not the subscription).
-- Not Grok Web / Grok Build SSO gateways (`cli-chat-proxy.grok.com`).
-- Not Cursor Cloud Agents (those consume included usage, then on-demand).
-- Not a substitute for the Grok Bot desktop/iOS app (no cloud computer, no
-  connectors). Only the **inference meter** is shared.
+The upstream can bind a client type to additional properties such as a particular
+version, application build, device state, machine identifier, or attestation.
+It can also remove or rename the type. Any of those changes can cause prefixed
+requests to fail independently of the base model and credential.
 
-## Risk
-
-`sand` is the production client-type of the official Grok Bot desktop app
-(`com.anysphere.sand`). Using it from this CLI transport is unofficial.
-Upstream can bind the type to a desktop version, a machine checksum, or both.
-Treat the prefix as best-effort and keep request volume ordinary.
+For diagnosis, first remove the prefix and compare the same request using the
+default `cli` identity. Keep this experimental feature out of critical workflows.
