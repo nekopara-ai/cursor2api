@@ -14,11 +14,12 @@ Cursor account.
 > before using it.
 
 > [!IMPORTANT]
-> This repository is fully open source under the MIT License: use, modification,
-> redistribution, and commercial use are allowed under the license terms. If the
-> project helps you, please [star it on GitHub](https://github.com/nekopara-ai/cursor2api).
-> The star is a strongly requested way to support maintenance, not a license
-> condition, and the software does not verify stars or collect GitHub credentials.
+> This version is public source under the custom
+> [Star Required Public Source License](LICENSE), not MIT. Before using, running,
+> copying, modifying, redistributing, sublicensing, or selling it, every Licensee
+> **must [Star the canonical GitHub repository](https://github.com/nekopara-ai/cursor2api)**
+> and keep that Star continuously in place. Without the required Star, no license
+> permission is granted. The software does not request GitHub passwords or tokens.
 
 The project is intended for local development, interoperability experiments,
 and protocol research. It is not a drop-in implementation of either vendor API,
@@ -38,7 +39,7 @@ and it should not be operated as a public or multi-tenant service.
 - Live continuation of tool-call turns when the complete matching tool-result
   set is returned promptly.
 - Per-request model-prefix routing between the regular agent stream and the
-  narrower, text-only Sand / Grok Bot backend.
+  Sand InferenceService/Stream backend.
 
 ## Project boundaries
 
@@ -50,7 +51,7 @@ and it should not be operated as a public or multi-tenant service.
 | Token counts and usage | Approximated | Counts may be estimated or clamped because Cursor does not expose equivalent per-request counters for every tool turn. |
 | Sampling and response controls | Accepted with no equivalent behavior | Parameters such as `temperature`, `top_p`, `seed`, penalties, `n`, and `response_format` are not forwarded to an equivalent upstream control. |
 | Model aliases | Best effort | Unknown model names fall back to `DEFAULT_MODEL` instead of returning a validation error. |
-| Sand / Grok Bot prefixes | Text-only subset | `sand/`, `bot/`, and `grokbot/` use a separate temporary-Agent gateway and explicitly reject tools, attachments, structured output, multiple choices, logprobs, and reasoning blocks. |
+| Sand / Grok Bot prefixes | Stream subset | `sand/`, `bot/`, and `grokbot/` use `aiserver.v1.InferenceService/Stream` (connect+json). Caller tools are supported; attachments, structured output, multiple choices, logprobs, and reasoning blocks are still rejected. |
 | Regular client prefix | Experimental | `cli/` keeps the regular bidirectional AgentService route; upstream acceptance is not guaranteed. |
 | Upstream protocol | Unstable | Field numbers and required headers can change with Cursor releases. |
 
@@ -136,8 +137,8 @@ upstream catalog request fails.
 
 ## Sand / Grok Bot mode
 
-Prefix a model with `sand/` (aliases: `bot/`, `grokbot/`) to use the
-account's separate Sand / Grok Bot path through the newer in-box gateway:
+Prefix a model with `sand/` (aliases: `bot/`, `grokbot/`) to use Cursor's
+`InferenceService/Stream` path with `x-cursor-client-type: sand`:
 
 ```bash
 curl http://127.0.0.1:8787/v1/messages \
@@ -150,30 +151,27 @@ curl http://127.0.0.1:8787/v1/messages \
   }'
 ```
 
-Sand mode preserves the existing Anthropic/OpenAI text response shapes, but it is
-**text API compatibility, not full Cursor or vendor API equivalence**. Each normal
-request creates a temporary Sand Agent, watches its plain-text transcript, emits
-incremental text, and deletes the Agent during cleanup.
+Sand mode preserves Anthropic/OpenAI response shapes for text and caller tools.
+It is **not** the regular `AgentService/Run` stream and not full vendor API
+equivalence. Each request is a connect+json POST with a 5-byte envelope,
+`Authorization: Bearer <session JWT>`, `x-cursor-client-type: sand`, and
+`x-cursor-checksum`. Grok accepts native tools; Claude models use an XML prompt
+plus a stream-side parser. Tool results go on the next Stream POST.
 
 | Capability in Sand mode | Status |
 |---|---|
 | Streaming and non-streaming text | Supported |
-| System prompts and text conversation history | Supported by prompt serialization |
+| System prompts and text conversation history | Supported as Stream messages |
+| Caller tools / OpenAI function calling | Supported |
+| Structured tool-call history and tool results | Supported on the next Stream turn |
 | Stop sequences and output limits | Approximated locally |
 | Usage fields | Estimated; not billing-authoritative |
-| Caller tools / OpenAI function calling | Unsupported; returns `400 invalid_request_error` |
-| Structured tool-call history and tool results | Unsupported; returns `400` |
 | Images, PDFs, files, and audio | Unsupported; returns `400` |
 | JSON Schema / structured output / non-text modalities | Unsupported; returns `400` |
 | `n != 1`, logprobs, thinking, and reasoning blocks | Unsupported; returns `400` |
-| Exact model selection after the prefix | Not available |
 
-The text after `sand/` is retained as a client-facing routing and response label.
-Sand's `sendPrompt` request has no model-selection field, so a name such as
-`sand/claude-fable-5` does not guarantee that exact backend or reasoning setting.
-Sand's own internal tools are not exposed as standard `tool_use` or `tool_calls`
-events. Claude Code, Codex, and agent frameworks that require caller tool-result
-round trips are therefore not compatible with this mode.
+The text after `sand/` is sent as `modelId` / `requestedModel`. Upstream may still
+remap it. Builtin Cursor/MCP tools from the regular agent path are not used here.
 
 See [API reference](docs/api-reference.md) and
 [client routing](docs/usage-pools.md) for the exact boundary.
@@ -222,11 +220,14 @@ change.
 
 ## License and trademarks
 
-The code is available under the [MIT License](LICENSE). It may be used,
-modified, redistributed, sublicensed, and sold subject to that license. If you
-use or benefit from the project, the maintainers strongly ask you to
-[star the repository](https://github.com/nekopara-ai/cursor2api); this support
-request is not an additional license restriction.
+The code is available under the custom
+[Star Required Public Source License 1.0](LICENSE). Personal, commercial,
+modified, redistributed, sublicensed, and sold uses are permitted only while
+the applicable Licensee continuously
+[Stars the canonical repository](https://github.com/nekopara-ai/cursor2api).
+Missing or removing the Star automatically terminates the permissions for this
+version. This is not an OSI-approved open-source license. Earlier releases
+already distributed under MIT retain the rights granted with those releases.
 
 Cursor, Anthropic, OpenAI, xAI, and related product names are trademarks of their
 respective owners and are used here only to identify interoperability targets.

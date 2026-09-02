@@ -44,28 +44,23 @@ Assistants APIs, or Anthropic administrative/batch APIs.
 
 Bare model names and the `cli/` prefix use the regular bidirectional
 `AgentService/Run` backend. The `sand/`, `bot/`, and `grokbot/` prefixes
-use a separate Sand / Grok Bot adapter backed by a temporary Agent in Cursor's
-in-box gateway.
+use `aiserver.v1.InferenceService/Stream`.
 
-Sand mode preserves the downstream text response envelopes, but its verified
-surface is deliberately smaller:
+Sand mode preserves downstream text and caller-tool envelopes, with a smaller
+attachment/output surface:
 
 | Sand request feature | Behavior |
 |---|---|
 | Streaming or buffered text | Supported |
-| System text and text-only history | Serialized into the prompt |
+| System text and text-only history | Stream messages |
+| Caller tools, function calling, tool history, or tool results | Supported |
 | Stop sequences and output limits | Applied locally and approximately |
 | Usage | Estimated from request/output size |
-| Caller tools, function calling, tool history, or tool results | Rejected with `400 invalid_request_error` |
 | Images, documents, PDFs, files, or audio | Rejected with `400 invalid_request_error` |
 | JSON Schema, structured output, or non-text modalities | Rejected with `400 invalid_request_error` |
 | `n != 1`, logprobs, thinking, or reasoning blocks | Rejected with `400 invalid_request_error` |
-| Model selection after the prefix | Not available in the upstream `sendPrompt` request |
+| Model selection after the prefix | Sent as `modelId` / `requestedModel`; upstream may remap |
 
-The Sand gateway transcript exposes plain assistant text, not standard structured
-tool events. Sand's own internal tools cannot be converted into caller-visible
-`tool_use` or `tool_calls` events. Clients that require tool-result round trips
-must use the regular route.
 
 ## Anthropic-style Messages
 
@@ -88,7 +83,7 @@ On the regular route, commonly supported inputs include:
 `messages` must be present and non-empty. Validation is intentionally limited;
 malformed nested structures may surface as a generic 4xx, 5xx, or upstream error
 rather than a field-by-field vendor-compatible validation response. Sand-prefixed
-requests are checked against the smaller text-only surface before conversion or
+requests are checked against the Sand Stream capability surface before conversion or
 Agent creation.
 
 #### Message history
@@ -299,9 +294,8 @@ control. This includes, but is not limited to:
 - arbitrary metadata.
 
 Acceptance means the request can proceed; it does not mean the requested behavior
-is implemented. This paragraph describes the regular route. Sand mode rejects
-fields that would materially change the response shape instead of silently
-accepting them; see [Backend selection and Sand mode](#backend-selection-and-sand-mode).
+is implemented. Sand mode still rejects attachments and extra output modes; caller
+tools are accepted. See [Backend selection and Sand mode](#backend-selection-and-sand-mode).
 
 ## Errors
 

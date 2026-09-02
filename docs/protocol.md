@@ -18,8 +18,7 @@ The proxy currently depends on five upstream surfaces across two backends:
 |---|---|
 | `agent.v1.AgentService/Run` | Regular Cursor bidirectional model and tool stream |
 | `aiserver.v1.AiService/AvailableModels` | Regular account model catalog |
-| `agent.v1.GrokBotService/EnsureSandBox` | Sand gateway allocation |
-| Sand gateway `/health` and `/api/*` endpoints | Temporary text-agent lifecycle |
+| `aiserver.v1.InferenceService/Stream` | Sand connect+json generation and caller tools |
 | Cursor auth endpoints | API-key exchange and browser-login polling |
 
 The agent host is fixed in `cursor2api/session.py`. Authentication and catalog
@@ -54,47 +53,31 @@ from a different product, even when paired with that product's client type, can
 be rejected. Misleading upstream error codes are possible when the value is stale
 or incompatible.
 
-## Sand v2 gateway
+## Sand Stream
 
-The Sand route uses a separate service rather than changing the regular
-`AgentService/Run` client-type header. The observed compatibility context is
-`CURSOR_DESKTOP_VERSION=3.18.9`; like the CLI version above, it is
-version-sensitive and must be revalidated before changing it.
-
-The first step is a Connect+JSON request to:
+The Sand route uses a separate service rather than changing only the regular
+`AgentService/Run` client-type header.
 
 ```text
-POST https://agentn.global.api5.cursor.sh/agent.v1.GrokBotService/EnsureSandBox
+POST https://api2.cursor.sh/aiserver.v1.InferenceService/Stream
 content-type: application/connect+json
 connect-protocol-version: 1
+authorization: Bearer <session JWT>
+x-cursor-client-type: sand
+x-cursor-checksum: <base64 xor-chain timestamp + machine ids>
 ```
 
-The response supplies a `gateway_url`, `gateway_token`, and
-`network_token`. The implementation accepts only HTTPS gateways whose hostname
-is `.cursorvm.com` or a subdomain of it. These credentials are ephemeral and
-must remain in memory.
+The JSON body is wrapped in a 5-byte envelope: flag `0x00` plus a big-endian
+payload length. Bare JSON is rejected as an incomplete envelope.
 
-The allocated gateway exposes the observed lifecycle:
+The request includes `modelId`, `requestedModel`, conversation `messages`, and
+optionally native `tools`. Grok emits `toolCallPart` frames. Claude models that
+reject native tools are prompted with XML and parsed locally. Tool results are
+not MCP replies; they are the next Stream POST.
 
-```text
-GET  /health
-POST /api/createAgent
-POST /api/sendPrompt
-POST /api/promptAcceptanceStatus
-POST /api/getAgentTranscript
-POST /api/deleteAgent
-```
-
-`sendPrompt` carries a plain prompt, a request nonce, and an empty attachment
-list. The observed schema has no requested-model field, tool definitions, tool
-results, or structured-output contract. Transcript entries expose plain
-user/assistant messages. Current compatibility evidence therefore covers
-text-only prompts and text transcripts, not the regular Cursor tool protocol.
-
-The nonce provides idempotency. After an ambiguous send failure, check
-`promptAcceptanceStatus` before retrying with the same nonce. Every successful
-`createAgent` must be paired with `deleteAgent` in cleanup, including request
-failure and cancellation paths.
+`CURSOR_GROKBOT_URL` remains the Sand Stream base URL (default
+`https://api2.cursor.sh`). `CURSOR_MACHINE_ID` and `CURSOR_MAC_MACHINE_ID` can
+override checksum machine ids.
 
 ## Connect framing
 

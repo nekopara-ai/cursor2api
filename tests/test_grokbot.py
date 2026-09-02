@@ -1,34 +1,18 @@
-"""Offline contract tests for the Sand v2 GrokBot compatibility backend."""
+"""Offline contract tests for the Sand InferenceService/Stream backend."""
 
-import base64
+import io
 import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from cursor2api import grokbot, models, server, session as session_mod
+from cursor2api import grokbot, models, server
 from cursor2api.grokbot import GrokBotError, GrokBotSession
 
 
-def transcript(text=None, terminal=False):
-    entries = []
-    if text is not None:
-        body = {"kind": "send-message",
-                "message": {"type": "text", "content": text}}
-        entries.append({
-            "seq": "1",
-            "entryKind": "send-message",
-            "body": base64.b64encode(json.dumps(body).encode()).decode(),
-        })
-    if terminal:
-        body = {"kind": "turn-completed", "status": "completed"}
-        entries.append({
-            "seq": "2",
-            "entryKind": "turn-completed",
-            "body": base64.b64encode(json.dumps(body).encode()).decode(),
-        })
-    return {"entries": entries}
+def stream_bytes(*frames):
+    return b"".join(grokbot.envelope(frame) for frame in frames)
 
 
 class Clock:
@@ -42,54 +26,39 @@ class Clock:
         self.value += seconds
 
 
+class FakeResp:
+    def __init__(self, data):
+        self._fp = io.BytesIO(data)
+        self.closed = False
+
+    def read(self, n=-1):
+        return self._fp.read(n)
+
+    def close(self):
+        self.closed = True
+
+
 class FakeClient:
-    def __init__(self, snapshots=None):
-        self.snapshots = list(snapshots or [transcript("OK", terminal=True)])
-        self.created = []
-        self.sent_messages = []
-        self.status_queries = []
-        self.interrupted = []
+    def __init__(self, streams=None):
+        default = [[{"textPart": {"text": "OK"}}]]
+        self.streams = list(streams if streams is not None else default)
+        self.opened = []
         self.deleted = []
-        self.send_errors = []
-        self.health_states = []
-        self.state = "SAND_BOX_RUN_STATE_RUNNING"
+        self.interrupted = False
+        self.open_errors = []
         self.lock = threading.Lock()
 
-    def sandbox_state(self):
-        return self.state
-
-    def ensure_sandbox(self):
-        self.state = "SAND_BOX_RUN_STATE_RUNNING"
-        return {}
-
-    def gateway_health(self):
-        busy = self.health_states.pop(0) if self.health_states else False
-        return {"ok": True, "isBusy": busy}
-
-    def create_agent(self, name, agent_id):
+    def open_stream(self, req_body, timeout=600):
         with self.lock:
-            row_id = "row-%d" % (len(self.created) + 1)
-            self.created.append((row_id, agent_id, name))
-        return {"id": row_id, "agentId": agent_id}
-
-    def send(self, agent_id, message_id, text):
-        self.sent_messages.append((agent_id, message_id, text))
-        if self.send_errors:
-            raise self.send_errors.pop(0)
-        return {"accepted": True}
-
-    def send_status(self, agent_id, message_id):
-        self.status_queries.append((agent_id, message_id))
-        return {"outcome": "found", "record": {"status": "accepted"}}
-
-    def transcript(self, agent_id):
-        if len(self.snapshots) > 1:
-            return self.snapshots.pop(0)
-        return self.snapshots[0]
-
-    def interrupt(self, agent_id, reason):
-        self.interrupted.append((agent_id, reason))
-        return {}
+            self.opened.append(req_body)
+            if self.open_errors:
+                raise self.open_errors.pop(0)
+            payload = self.streams.pop(0) if len(self.streams) > 1 else self.streams[0]
+        if isinstance(payload, (bytes, bytearray)):
+            data = bytes(payload)
+        else:
+            data = stream_bytes(*payload)
+        return FakeResp(data)
 
     def delete_agent(self, row_id):
         self.deleted.append(row_id)
@@ -99,122 +68,108 @@ class FakeClient:
 class GrokBotSessionTest(unittest.TestCase):
     def session(self, client=None, **kwargs):
         clock = kwargs.pop("clock", Clock())
+        model = kwargs.pop("model", "claude-fable-5")
         return GrokBotSession(
-            model="claude-fable-5",
+            model=model,
             _client=client or FakeClient(),
             _clock=clock.now,
             _sleep=clock.sleep,
-            poll_interval=1,
-            settle_seconds=2,
             **kwargs,
         )
 
-    @patch("cursor2api.grokbot.AGENT_READY_DELAY", 0)
-    def test_snapshot_growth_becomes_incremental_text_and_cleans_up(self):
-        client = FakeClient([
-            transcript("Hel"),
-            transcript("Hello", terminal=True),
-        ])
-        client.health_states = [False, True, False]
+    def test_text_parts_are_streamed_and_closed(self):
+        client = FakeClient([[
+            {"textPart": {"text": "Hel"}},
+            {"textPart": {"text": "lo"}},
+        ]])
         session = self.session(client)
         session.start("say hello")
-
         self.assertEqual(
-            [("text", "Hel"), ("tick", None), ("text", "lo"),
-             ("end", "turn_finished")],
+            [("text", "Hel"), ("text", "lo"), ("end", "turn_finished")],
             list(session.events(first_timeout=5, hard_timeout=20)),
         )
-
         session.close()
-        self.assertFalse(client.interrupted)
-        self.assertEqual([session.row_id], client.deleted)
+        self.assertTrue(client.opened)
+        self.assertTrue(session.closed)
         session.close()
-        self.assertEqual(1, len(client.deleted), "cleanup must be idempotent")
+        self.assertEqual(1, len(client.opened), "cleanup must be idempotent")
 
-    @patch("cursor2api.grokbot.AGENT_READY_DELAY", 0)
-    def test_retry_checks_idempotency_status_before_resending(self):
+    def test_rejected_stream_is_an_error(self):
         client = FakeClient()
-        client.send_errors = [GrokBotError(
-            "SendGrokBotUserMessage", 503, "unavailable", "connection reset", True)]
-        session = self.session(client)
-
-        session.start("one charge only")
-
-        self.assertTrue(session.sent)
-        self.assertEqual(1, len(client.sent_messages))
-        self.assertEqual(1, len(client.status_queries))
-        self.assertEqual(client.sent_messages[0][1], client.status_queries[0][1])
-
-    @patch("cursor2api.grokbot.AGENT_READY_DELAY", 0)
-    def test_rejected_send_is_an_error_and_agent_is_deleted(self):
-        class RefusingClient(FakeClient):
-            def send(self, agent_id, message_id, text):
-                self.sent_messages.append((agent_id, message_id, text))
-                raise GrokBotError("sendPrompt", 403, "permission_denied",
-                                   "quota", False)
-
-        client = RefusingClient()
+        client.open_errors = [GrokBotError("Stream", 403, "permission_denied",
+                                           "quota", False)]
         session = self.session(client)
         session.start("hello")
         events = list(session.events())
         session.close()
-
         self.assertEqual("error", events[0][0])
         self.assertIn("permission_denied", events[0][1])
-        self.assertEqual([session.row_id], client.deleted)
-        self.assertFalse(client.interrupted, "an unsent request must not be interrupted")
+        self.assertFalse(session.sent)
 
-    @patch("cursor2api.grokbot.AGENT_READY_DELAY", 0)
     def test_no_output_times_out_instead_of_returning_empty_success(self):
-        client = FakeClient([transcript()])
-        session = self.session(client)
+        client = FakeClient([[]])
+        clock = Clock()
+        session = self.session(client, clock=clock)
         session.start("hello")
-
+        clock.value = 5
         events = list(session.events(first_timeout=3, hard_timeout=10))
         session.close()
-
         self.assertEqual("error", events[-1][0])
         self.assertIn("did not respond", events[-1][1])
-        self.assertEqual([session.row_id], client.deleted)
 
-    @patch("cursor2api.grokbot.AGENT_READY_DELAY", 0)
-    def test_transcript_rewrite_is_not_duplicated(self):
-        client = FakeClient([transcript("abcdef"), transcript("abcXYZ")])
-        client.health_states = [False, True, True]
-        session = self.session(client)
-        session.start("hello")
-
-        events = list(session.events(first_timeout=5, hard_timeout=10))
-
-        self.assertEqual(("text", "abcdef"), events[0])
-        self.assertEqual("error", events[-1][0])
-        self.assertIn("rewrote", events[-1][1])
-
-    def test_tools_and_attachments_fail_explicitly_without_creating_agent(self):
+    def test_attachments_fail_without_opening_stream(self):
         client = FakeClient()
-        with_tools = self.session(client, tools=[{
-            "name": "echo", "description": "", "input_schema": {"type": "object"}
-        }])
-        with_tools.start("hello")
-        self.assertIn("unsupported_feature", list(with_tools.events())[0][1])
-
         with_image = self.session(client)
         with_image.start("hello", images=[(b"x", "image/png", 1, 1)])
         self.assertIn("unsupported_feature", list(with_image.events())[0][1])
-        self.assertFalse(client.created)
+        self.assertFalse(client.opened)
 
-    @patch("cursor2api.grokbot.AGENT_READY_DELAY", 0)
+    def test_grok_tools_are_sent_natively(self):
+        client = FakeClient([[
+            {"toolCallPart": {"toolName": "echo", "args": '{"q":1}',
+                              "toolCallId": "call_1", "isComplete": True}},
+        ]])
+        session = self.session(client, model="grok-4.6", tools=[{
+            "name": "echo", "description": "", "input_schema": {"type": "object"}
+        }])
+        session.start("hello")
+        events = list(session.events())
+        self.assertEqual("tool_use", events[0][0])
+        self.assertEqual("echo", events[0][1]["name"])
+        req = client.opened[0]
+        self.assertEqual("echo", req["tools"][0]["name"])
+        session.send_tool_results([(None, "call_1", "ok", False)])
+        self.assertEqual(2, len(client.opened))
+        follow = client.opened[1]
+        self.assertTrue(any(m.get("toolContent") for m in follow["messages"]))
+
+    def test_claude_tools_are_prompted_as_xml(self):
+        xml = "<tool_call><name>echo</name><parameter name=\"q\">1</parameter></tool_call>"
+        client = FakeClient([[{"textPart": {"text": xml}}]])
+        session = self.session(client, tools=[{
+            "name": "echo", "description": "d",
+            "input_schema": {"type": "object", "properties": {"q": {"type": "integer"}}}
+        }])
+        session.start("hello")
+        events = list(session.events())
+        self.assertEqual("tool_use", events[0][0])
+        self.assertEqual("echo", events[0][1]["name"])
+        self.assertEqual(1, events[0][1]["input"]["q"])
+        req = client.opened[0]
+        self.assertNotIn("tools", req)
+        sys_text = req["messages"][0]["text"]
+        self.assertIn("<tool_call>", sys_text)
+
     def test_system_prompt_is_preserved_in_sent_text(self):
         client = FakeClient()
         session = self.session(client, system="Follow the system marker.")
         session.start("Human: history\nAssistant: prior\nHuman: current")
+        payload = client.opened[0]
+        texts = [m["text"] for m in payload["messages"]]
+        self.assertIn("Follow the system marker.", texts[0])
+        self.assertTrue(texts[-1].endswith("Human: current"))
 
-        payload = client.sent_messages[0][2]
-        self.assertIn("<system>\nFollow the system marker.\n</system>", payload)
-        self.assertTrue(payload.endswith("Human: current"))
-
-    @patch("cursor2api.grokbot.AGENT_READY_DELAY", 0)
-    def test_concurrent_sessions_use_distinct_agents_and_all_clean_up(self):
+    def test_concurrent_sessions_use_distinct_conversations(self):
         client = FakeClient()
 
         def run(marker):
@@ -222,16 +177,14 @@ class GrokBotSessionTest(unittest.TestCase):
             session.start(marker)
             events = list(session.events(first_timeout=5, hard_timeout=10))
             session.close()
-            return session.agent_id, events
+            return session.conv, events
 
         with ThreadPoolExecutor(max_workers=5) as pool:
             results = list(pool.map(run, ["case-%d" % i for i in range(5)]))
 
-        agent_ids = [agent_id for agent_id, _ in results]
-        self.assertEqual(5, len(set(agent_ids)))
-        self.assertEqual(5, len(client.created))
-        self.assertEqual(5, len(client.deleted))
-        self.assertEqual({row for row, _, _ in client.created}, set(client.deleted))
+        convs = [conv for conv, _ in results]
+        self.assertEqual(5, len(set(convs)))
+        self.assertEqual(5, len(client.opened))
 
 
 class ServerRoutingTest(unittest.TestCase):
@@ -303,23 +256,29 @@ class ServerRoutingTest(unittest.TestCase):
             "thinking": {"type": "enabled"},
         }))
 
-    def test_global_sand_default_uses_the_same_capability_gate(self):
-        with patch.object(session_mod, "CLIENT_TYPE", "sand"):
-            self.assertIn("caller-owned tools", server.sand_request_error({
-                "model": "claude-fable-5",
-                "messages": [{"role": "user", "content": "hello"}],
-                "tools": [{"name": "echo"}],
-            }))
-
-    def test_sand_rejects_tools_attachments_and_structured_tool_history(self):
+    def test_sand_allows_tools_but_rejects_attachments(self):
+        self.assertIsNone(server.sand_request_error({
+            "model": "sand/claude-fable-5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"name": "echo"}],
+        }))
+        self.assertIsNone(server.sand_request_error({
+            "model": "sand/claude-fable-5",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_1", "name": "echo", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}
+                ]},
+            ],
+            "tools": [{"name": "echo"}],
+        }))
         cases = [
-            ({"tools": [{"name": "echo"}]}, False, "caller-owned tools"),
             ({"messages": [{"role": "user", "content": [{"type": "image"}]}]},
              False, "image input"),
             ({"messages": [{"role": "user", "content": [{"type": "document"}]}]},
              False, "PDF input"),
-            ({"messages": [{"role": "assistant", "tool_calls": [{"id": "call_1"}]}]},
-             True, "tool-call history"),
             ({"messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}
             ]}]}, True, "image input"),

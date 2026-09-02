@@ -182,29 +182,23 @@ Live tool sessions are stored only in process memory and expire after
 If a client waits longer than the TTL before returning results, replay is expected
 and not necessarily an error.
 
-## Sand gateway operation
+## Sand Stream operation
 
-The local `/health` endpoint does not allocate or test a Sand gateway. A Sand
-request performs `EnsureSandBox`, creates a temporary Agent, sends one prompt,
-polls acceptance and transcript state, and deletes the Agent in cleanup.
+The local `/health` endpoint does not call InferenceService/Stream. A Sand
+request opens one connect+json Stream POST.
 
 Operational consequences:
 
-- unsupported features are rejected with HTTP 400 before an Agent is created;
-- an abrupt process or host failure can interrupt cleanup and leave a temporary
-  Agent upstream, so inspect the account's Agent list after abnormal shutdown;
-- gateway, network, and Agent tokens are ephemeral secrets and must not be logged
-  or persisted;
+- attachments, structured output, `n != 1`, logprobs, and thinking are rejected
+  with HTTP 400 before Stream is opened; caller tools are allowed;
+- there is no temporary Agent to delete;
 - Sand uses the standard library HTTP client and its normal
   `https_proxy`/`HTTPS_PROXY` behavior; `CURSOR2API_PROXY` configures the
   regular HTTP/2 transport only;
 - failures before response streaming use the mapped HTTP error status, while
   failures after SSE headers are committed appear as terminal error events; and
-- a successful text probe confirms only the text transcript path, not tools,
-  attachments, exact model selection, or structured output.
-
-For a cleanup-sensitive probe, compare the visible Agent set before and after the
-request and allow for normal upstream deletion propagation.
+- a successful text probe does not prove attachments, exact quota accounting, or
+  structured output.
 
 ## Proxy operation
 
@@ -278,7 +272,7 @@ Because compatibility depends on private upstream behavior:
 4. start the candidate on a separate local port;
 5. verify liveness, credentials, model catalog, one text request, one streaming
    request, and any tool/image paths your deployment depends on; if Sand is used,
-   also run a Sand text probe and confirm the temporary Agent set returns to its
+   also run a Sand text probe and, if tools matter, a caller-tool probe
    pre-test state;
 6. activate the candidate through the existing supervisor or service manager;
 7. verify the new process identity and a real request; and

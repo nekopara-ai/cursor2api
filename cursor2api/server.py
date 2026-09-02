@@ -15,11 +15,9 @@ Supported
   extended thinking blocks, usage, stop_reason, x-api-key / bearer gate.
 
 Sand / Grok Bot compatibility
-  Models prefixed with ``sand/`` use the newer in-box Sand gateway.  That path
-  is text-only: streaming/non-streaming text, system prompts and text history
-  are supported, while caller tools, structured tool history, attachments,
-  structured output, multiple choices, logprobs and thinking blocks are
-  rejected explicitly instead of being silently ignored.
+  Models prefixed with ``sand/`` use InferenceService/Stream. Text and caller
+  tools are supported. Attachments, structured output, multiple choices,
+  logprobs and thinking blocks are rejected explicitly.
 
 Approximated client-side (Cursor's protocol has no knob for them)
   stop_sequences  cut when the sequence appears (stop_reason stop_sequence)
@@ -285,7 +283,7 @@ def _message_feature(body, openai=False):
             continue
         if openai:
             if message.get("role") == "tool" or message.get("tool_calls"):
-                return "structured tool-call history"
+                continue
             content = message.get("content")
             if not isinstance(content, list):
                 continue
@@ -310,7 +308,7 @@ def _message_feature(body, openai=False):
                 if kind == "document":
                     return "document or PDF input"
                 if kind in ("tool_use", "tool_result"):
-                    return "structured tool-call history"
+                    continue
     return None
 
 
@@ -318,7 +316,7 @@ def sand_request_error(body, openai=False):
     """Return a stable client error for unsupported Sand API capabilities.
 
     ``None`` means this is not a Sand request or that the request stays inside
-    the verified text-only compatibility surface. Validation happens before
+    the Sand Stream capability surface. Validation happens before
     OpenAI-to-Anthropic conversion so fields such as ``response_format`` and
     ``logprobs`` cannot disappear and look as though they were honoured.
     """
@@ -326,8 +324,9 @@ def sand_request_error(body, openai=False):
     if client_type != "sand":
         return None
 
-    if body.get("tools"):
-        return "Sand text mode does not support caller-owned tools or function calling"
+    # Caller-owned tools now go through InferenceService/Stream (native for
+    # Grok, XML-prompted for Claude). Attachments and extra output modes stay
+    # rejected until Sand Stream can preserve them.
 
     feature = _message_feature(body, openai=openai)
     if feature:

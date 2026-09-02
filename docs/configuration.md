@@ -53,7 +53,7 @@ endpoint you do not trust.
 | `CURSOR_API_BASE_URL` | `https://api2.cursor.sh` | Base URL for API-key exchange and browser-login polling. |
 | `CURSOR_WEBSITE_URL` | `https://cursor.com` | Base URL used to build the browser authorization link. |
 | `CURSOR_AISERVER_URL` | `https://api2.cursor.sh` | Base URL for the model-catalog RPC. |
-| `CURSOR_GROKBOT_URL` | `https://api2.cursor.sh` | Base URL for Sand control-plane RPCs such as `EnsureSandBox`. It receives the Cursor access token. |
+| `CURSOR_GROKBOT_URL` | `https://api2.cursor.sh` | Base URL for Sand `InferenceService/Stream`. It receives the Cursor session token. |
 
 The streaming agent host and path are currently fixed in the implementation.
 
@@ -83,26 +83,23 @@ still expose them to local inspection and process managers.
 
 Model prefixes override `CURSOR2API_CLIENT_TYPE` per request:
 
-- `sand/`, `bot/`, and `grokbot/` select the separate Sand gateway backend;
+- `sand/`, `bot/`, and `grokbot/` select the Sand Stream backend;
 - `cli/` selects the regular bidirectional AgentService backend.
 
 A process-wide `CURSOR2API_CLIENT_TYPE=sand` sends unprefixed requests through
 the same Sand backend and capability gate. This routing is experimental. See
 [Client routing and Sand mode](usage-pools.md).
 
-## Sand gateway
+## Sand Stream
 
 | Variable | Default | Description |
 |---|---:|---|
-| `CURSOR_DESKTOP_VERSION` | `3.18.9` | Version string used for Sand control-plane requests. This is a separate private protocol contract from `CURSOR_CLI_VERSION`. |
-| `CURSOR2API_SAND_POLL` | `0.5` | Delay between Sand transcript polls. |
-| `CURSOR2API_SAND_SETTLE` | `6` | Quiet-text interval after which a non-busy Sand Agent is treated as complete when no explicit terminal marker is available. |
-| `CURSOR2API_SAND_AGENT_READY` | `0` | Optional delay after temporary Agent creation before sending the prompt. |
+| `CURSOR_DESKTOP_VERSION` | `3.18.9` | Version string sent on Sand Stream requests. Separate from `CURSOR_CLI_VERSION`. |
+| `CURSOR_MACHINE_ID` | derived | Optional checksum machine id. When empty, a stable hash of the session token is used. |
+| `CURSOR_MAC_MACHINE_ID` | empty | Optional second machine id concatenated into `x-cursor-checksum`. |
 
-The Sand adapter obtains an ephemeral gateway URL and tokens from Cursor, validates
-that the URL is HTTPS on a `.cursorvm.com` host, and keeps those values in memory.
-It uses standard `urllib` proxy handling; `CURSOR2API_PROXY` only configures the
-regular custom HTTP/2 transport.
+The Sand adapter uses standard `urllib` proxy handling; `CURSOR2API_PROXY` only
+configures the regular custom HTTP/2 transport.
 
 ## Request behavior
 

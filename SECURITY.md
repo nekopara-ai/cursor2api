@@ -54,9 +54,8 @@ issue.
 - unsafe handling of proxy authentication;
 - an endpoint override that leaks credentials contrary to documented behavior;
 - cross-request access to another caller's parked tool session;
-- cross-request access to a Sand transcript or temporary Agent;
-- failure to delete a Sand Agent on handled error or cancellation paths;
-- disclosure of Sand gateway, network, or Agent tokens; or
+- cross-request access to another caller's Sand Stream session;
+- disclosure of the Cursor session JWT or checksum machine ids; or
 - sensitive request content written to logs contrary to the documented logging
   contract.
 
@@ -88,8 +87,7 @@ controls are added externally:
 - `/health` is liveness, not upstream readiness;
 - `API_KEY` is one shared secret, not user or tenant isolation;
 - live tool-session state is process-local;
-- Sand requests create upstream temporary Agents and receive ephemeral gateway
-  credentials; and
+- Sand Stream uses the same Cursor session token plus checksum headers; and
 - `sandbox.py` is a compatibility layer, not an operating-system sandbox.
 
 Keep `BIND=127.0.0.1`, set `API_KEY`, and use a separately enforced reverse proxy,

@@ -17,10 +17,10 @@ cursor2api.server
         | regular / cli                       | sand / bot / grokbot
         v                                     v
 cursor2api.session                    cursor2api.grokbot
-        |-- protobuf + caller tools           |-- EnsureSandBox
-        v                                     |-- temporary Agent + transcript
+        |-- protobuf + caller tools           |-- connect+json envelope
+        v                                     |-- checksum + sand client-type
 cursor2api.h2stream                            v
-        |-- bidirectional Connect      Cursor in-box Sand gateway
+        |-- bidirectional Connect      InferenceService/Stream
         v
 Cursor agent endpoint
 ```
@@ -30,7 +30,7 @@ Cursor agent endpoint
 | Module | Responsibility |
 |---|---|
 | `cursor2api/server.py` | HTTP routes, local API-key gate, backend selection, Anthropic response shapes, OpenAI facade dispatch, live-session registry, usage normalization, turn logs |
-| `cursor2api/grokbot.py` | Sand control-plane and in-box gateway client, temporary Agent lifecycle, transcript-to-text events |
+| `cursor2api/grokbot.py` | Sand InferenceService/Stream client, checksum headers, native/XML tools, tool-result continuation |
 | `cursor2api/openai_api.py` | OpenAI Chat Completions request and response conversion |
 | `cursor2api/session.py` | Cursor Run request construction, protobuf field handling, upstream event decoding, tools, attachments, client identity |
 | `cursor2api/h2stream.py` | Raw TLS/HTTP/2 transport, flow control, connection prewarming, CONNECT proxy support |
@@ -49,36 +49,34 @@ Cursor agent endpoint
    `openai_api.to_anthropic()`.
 3. `Turn` separates an optional client prefix from the model string and asks
    `models.resolve()` for regular-route model metadata.
-4. Sand-selected requests are checked against the text-only capability surface.
-   Regular requests continue through message, attachment, and tool normalization.
+4. Sand-selected requests reject attachments and extra output modes, but allow
+   caller tools. Regular requests continue through message, attachment, and tool
+   normalization.
 5. `auth.access_token()` selects or derives a usable Cursor bearer token.
 6. On the regular route, matching tool results may claim a parked `Session`;
    otherwise `Session.start()` opens the bidirectional HTTP/2 stream.
-7. On the Sand route, `GrokBotSession` ensures the account sandbox, creates a
-   temporary Agent, sends one serialized text prompt, and polls transcript and
-   health snapshots.
+7. On the Sand route, `GrokBotSession` opens `InferenceService/Stream` and
+   converts Stream frames into the same local event contract.
 8. Each backend yields normalized events within the surface it supports.
 9. `server.py` renders those events as buffered JSON or HTTP/1.1 chunked SSE.
-10. Regular tool-call turns may remain parked. Sand terminal paths attempt to
-    delete the temporary Agent.
+10. Regular and Sand tool-call turns may remain parked for matching tool
+    results.
 
 ## Sand backend lifecycle
 
-The Sand path does not reuse the regular `AgentService/Run` stream. It calls the
-account control plane for an HTTPS gateway descriptor, validates the gateway host,
-then uses JSON endpoints inside the account's box:
+The Sand path does not reuse the regular `AgentService/Run` stream. It POSTs
+connect+json envelopes to `aiserver.v1.InferenceService/Stream` with a session
+JWT, `x-cursor-client-type: sand`, and `x-cursor-checksum`.
 
-1. ensure the SandBox and wait for gateway health;
-2. create one temporary Agent;
-3. serialize system text and text history into one prompt;
-4. send with a unique idempotency nonce;
-5. poll transcript snapshots and convert append-only text into deltas; and
-6. delete the Agent during cleanup.
+1. serialize system text, history, and optional tools into a Stream JSON body;
+2. wrap the body in a 5-byte envelope;
+3. stream JSON frames (`textDelta`, `toolCallPart`, finish);
+4. for Claude, parse XML tool calls from the text stream;
+5. park the session when caller tools are requested so results can be sent on
+   the next Stream POST.
 
-The gateway does not accept a model field, caller tool schema, tool result, or
-attachment upload in this implementation. The HTTP layer therefore rejects those
-request shapes before Agent creation. Abrupt process termination can prevent
-best-effort cleanup, so inspect the account's Agent list after abnormal shutdowns.
+Attachments, structured output, and reasoning blocks are still rejected before
+the Stream is opened.
 
 ## Why the regular transport is custom
 
@@ -134,10 +132,11 @@ publish neither do not receive an invented parameter.
 
 ## Tools and ownership
 
-The following tool behavior applies only to the regular backend. Sand mode does
-not expose caller-owned tool round trips.
+The following builtin/MCP filtering applies to the regular backend. Sand Stream
+sends caller tools natively (Grok) or as an XML prompt (Claude) and does not use
+Cursor MCP allowlists.
 
-With the default `CURSOR2API_TOOL_OWNER=caller`:
+On the regular route, with the default `CURSOR2API_TOOL_OWNER=caller`:
 
 - caller tool definitions are encoded as MCP tools;
 - the upstream allowed-tool header is restricted to MCP control entry points;

@@ -15,7 +15,7 @@ bypass account policy.
 |---|---|---|
 | `claude-fable-5` | `CURSOR2API_CLIENT_TYPE` (default `cli`) | `claude-fable-5` |
 | `cli/claude-fable-5` | Regular bidirectional AgentService route | `claude-fable-5` |
-| `sand/claude-fable-5` | Sand / Grok Bot in-box gateway | `claude-fable-5` |
+| `sand/claude-fable-5` | Sand InferenceService/Stream | `claude-fable-5` |
 | `bot/claude-fable-5` | Sand alias | `claude-fable-5` |
 | `grokbot/claude-fable-5` | Sand alias | `claude-fable-5` |
 
@@ -34,65 +34,70 @@ permissions and can make requests fail.
 
 ## Sand backend
 
-The Sand route uses the newer account-level control plane and in-box gateway:
+The Sand route uses a different RPC, not `AgentService/Run` with a different
+header:
 
-1. `EnsureSandBox` returns an ephemeral HTTPS gateway URL and tokens;
-2. the adapter validates the gateway host;
-3. one temporary Agent is created for the request;
-4. system text and text history are serialized into a plain prompt;
-5. transcript snapshots are converted into incremental assistant text; and
-6. the Agent is deleted during normal cleanup.
+```text
+POST https://api2.cursor.sh/aiserver.v1.InferenceService/Stream
+content-type: application/connect+json
+```
 
-This is a different protocol, not the regular Run stream with a different header.
+Required request properties:
+
+1. 5-byte connect envelope (`0x00` + big-endian length) around JSON;
+2. `Authorization: Bearer <session JWT>` (`type: session`, not a web cookie token);
+3. `x-cursor-client-type: sand`;
+4. `x-cursor-checksum` derived from a XOR-chained millisecond timestamp plus
+   machine ids (`CURSOR_MACHINE_ID` / `CURSOR_MAC_MACHINE_ID`, otherwise hashed
+   from the session token).
+
+Grok accepts native `tools` and emits `toolCallPart`. Claude models that reject
+native tools get an XML prompt and a stream-side parser. Caller tool results are
+sent on the next Stream POST (history `toolCalls` / `toolContent`), not MCP.
+
+This is a different protocol from the regular Run stream.
 
 ## Verified compatibility surface
 
 | Capability | Sand behavior |
 |---|---|
 | Streaming and non-streaming text | Supported |
-| System text and text-only history | Serialized into the prompt |
+| System text and text-only history | Stream `messages` |
+| Caller tools and OpenAI function calling | Supported |
+| Structured tool history and tool results | Next Stream POST |
 | Stop sequences and output caps | Local approximation |
 | Usage fields | Estimated |
-| Caller tools and OpenAI function calling | Rejected with HTTP 400 |
-| Structured tool history and tool results | Rejected with HTTP 400 |
 | Images, PDFs, files, and audio | Rejected with HTTP 400 |
 | JSON Schema and structured output | Rejected with HTTP 400 |
 | Multiple choices, logprobs, thinking, reasoning | Rejected with HTTP 400 |
 
-Sand's own internal tools are not returned as standard `tool_use`,
-`tool_calls`, or tool-result events. Tool-dependent clients such as Claude Code,
-Codex, and agent frameworks must use the regular backend.
+Regular-backend builtin/MCP tools are not used on this path.
 
 ## Model-name boundary
 
-The local server retains the text after `sand/` for client routing and response
-compatibility. The gateway's `sendPrompt` request has no model-selection field.
-A request named `sand/claude-fable-5` therefore does not prove that Sand selected
-that exact model, effort, context, or reasoning configuration.
+The text after `sand/` is sent as `modelId` / `requestedModel`. Upstream may still
+remap the model, effort, or reasoning configuration.
 
 ## Credentials and trust boundary
 
-Both backends begin with the same authorized Cursor access token. The Sand control
-plane returns a gateway bearer token and network token. The adapter:
+Both backends begin with the same authorized Cursor access token. Sand Stream
+requires a session-type JWT. A web-type token can pass AuthService but is
+rejected on Stream. The adapter:
 
-- requires an HTTPS URL whose hostname ends in `.cursorvm.com`;
-- keeps gateway credentials in memory;
-- sends a new request ID for gateway calls; and
-- does not expose those credentials to downstream clients.
+- keeps the token in the existing credential store;
+- does not log the full token;
+- sends a new request ID for Stream calls; and
+- does not expose upstream credentials to downstream clients.
 
 Endpoint overrides can redirect credential-bearing requests. Use them only with a
 trusted test target.
 
 ## Cleanup and failure behavior
 
-Normal completion, local stop limits, downstream disconnects, and request errors
-run the session cleanup path and attempt `deleteAgent`. A process crash or forced
-termination can prevent that call. After abnormal shutdown, inspect the account's
-Agent list before assuming no temporary Agent remains.
-
-Unsupported structured features are rejected before Agent creation. Transport,
-authentication, gateway, and account-capacity failures still surface through the
-normal local error mapping or, after streaming starts, an SSE error event.
+Sand Stream has no temporary Agent to delete. Failures before response streaming
+use the mapped HTTP error status; failures after SSE headers are committed appear
+as terminal error events. Missing checksums can surface as `ERROR_OUTDATED_CLIENT`.
+Naked JSON without the 5-byte envelope can surface as a protocol envelope error.
 
 ## What routing does not guarantee
 
@@ -111,7 +116,7 @@ credential, network path, and local server constant. Then separate:
 - local capability-gate errors;
 - credential rejection;
 - account/model permission;
-- gateway health and temporary-Agent cleanup;
+- Stream checksum / session-token / envelope errors;
 - rate or usage limits; and
 - transport or proxy failure.
 
