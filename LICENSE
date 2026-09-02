@@ -1,21 +1,97 @@
-MIT License
+STAR REQUIRED PUBLIC SOURCE LICENSE
+Version 1.0
 
 Copyright (c) 2026 cursor2api contributors
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This license is a custom public-source license. It is not the MIT License and
+has not been approved by the Open Source Initiative.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. DEFINITIONS
+
+"Software" means the software, source code, documentation, and associated files
+distributed with this license.
+
+"Canonical Repository" means:
+https://github.com/nekopara-ai/cursor2api
+
+"Star" means a GitHub star recorded for the Canonical Repository by a GitHub
+user account controlled by the Licensee or by a person expressly authorized to
+satisfy this condition on the Licensee's behalf.
+
+"Licensee" means each person or legal entity exercising any permission granted
+by this license. For a legal entity, one authorized Star satisfies the
+condition for personnel acting solely on that entity's behalf.
+
+2. CONDITIONAL GRANT OF RIGHTS
+
+Subject to continuous compliance with this license, permission is granted,
+free of charge, to use, run, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom
+the Software is furnished to do so.
+
+3. MANDATORY STAR CONDITION
+
+Before exercising any permission in Section 2, every Licensee MUST Star the
+Canonical Repository.
+
+The required Star MUST remain continuously in place for the entire period in
+which the Licensee possesses, runs, uses, modifies, publishes, distributes,
+sublicenses, sells, or otherwise exploits the Software.
+
+A Licensee without a GitHub account receives no permission under Section 2
+until the Licensee creates or controls an account and satisfies the mandatory
+Star condition. Use of a mirror, fork, archive, package, binary, container, or
+offline copy does not waive this condition.
+
+4. REDISTRIBUTION AND NOTICE
+
+Every copy or substantial portion of the Software must include this license
+and the copyright notice above.
+
+A distributor must prominently notify recipients that use of the Software
+requires a continuing Star of the Canonical Repository. Each recipient must
+independently satisfy this license before exercising any permission.
+
+5. COMPLIANCE EVIDENCE
+
+On reasonable written request from a copyright holder, a Licensee must identify
+the GitHub username used to satisfy the mandatory Star condition and provide
+reasonable public evidence of the Star.
+
+No Licensee is required to disclose a GitHub password, session cookie, personal
+access token, or other authentication secret.
+
+6. AUTOMATIC TERMINATION
+
+All permissions granted by this license terminate automatically and
+immediately when the required Star is absent, removed, or otherwise ceases to
+be recorded, or when the Licensee violates any other condition of this license.
+
+After termination, the Licensee must immediately stop using, running,
+modifying, distributing, sublicensing, selling, and otherwise exploiting the
+Software. Permissions are reinstated prospectively when the Licensee fully
+cures the violation and restores the required Star. Reinstatement does not
+retroactively authorize activity performed while the Licensee was
+noncompliant.
+
+7. EARLIER RELEASES AND THIRD-PARTY MATERIAL
+
+This license applies only to versions and portions of the Software distributed
+with this license by their respective copyright holders. It does not revoke or
+alter rights validly granted under an earlier license for an earlier release,
+and it does not replace the licenses of third-party components.
+
+8. NO GITHUB AFFILIATION
+
+This license and the Software are not sponsored by, endorsed by, or affiliated
+with GitHub, Inc. "GitHub" is a trademark of its owner.
+
+9. DISCLAIMER OF WARRANTY
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
