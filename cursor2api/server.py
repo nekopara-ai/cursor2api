@@ -14,6 +14,13 @@ Supported
   document/PDF blocks, tools -> native Cursor tool calls (tool_use / tool_result),
   extended thinking blocks, usage, stop_reason, x-api-key / bearer gate.
 
+Sand / Grok Bot compatibility
+  Models prefixed with ``sand/`` use the newer in-box Sand gateway.  That path
+  is text-only: streaming/non-streaming text, system prompts and text history
+  are supported, while caller tools, structured tool history, attachments,
+  structured output, multiple choices, logprobs and thinking blocks are
+  rejected explicitly instead of being silently ignored.
+
 Approximated client-side (Cursor's protocol has no knob for them)
   stop_sequences  cut when the sequence appears (stop_reason stop_sequence)
   max_tokens      cut on a ~4 chars/token estimate (stop_reason max_tokens)
@@ -33,6 +40,7 @@ from . import auth as auth_mod
 from . import h2stream, models, openai_api
 from .auth import AuthError
 from .session import HOST, Session, split_client_type
+from .grokbot import GrokBotSession
 
 BIND = os.environ.get("BIND", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8787"))
@@ -264,6 +272,96 @@ def tool_specs(tools):
     return out
 
 
+def _message_feature(body, openai=False):
+    """First structured message feature Sand cannot preserve, or ``None``.
+
+    The regular Cursor AgentService path still handles these features. Sand's
+    gateway exposes only prompt text and plain ``send-message`` transcript
+    entries, so accepting structured blocks here would falsely claim API
+    compatibility while flattening or dropping them.
+    """
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        if openai:
+            if message.get("role") == "tool" or message.get("tool_calls"):
+                return "structured tool-call history"
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                kind = part.get("type")
+                if kind in ("image_url", "input_image"):
+                    return "image input"
+                if kind in ("file", "input_file"):
+                    return "file or PDF input"
+        else:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                kind = block.get("type")
+                if kind == "image":
+                    return "image input"
+                if kind == "document":
+                    return "document or PDF input"
+                if kind in ("tool_use", "tool_result"):
+                    return "structured tool-call history"
+    return None
+
+
+def sand_request_error(body, openai=False):
+    """Return a stable client error for unsupported Sand API capabilities.
+
+    ``None`` means this is not a Sand request or that the request stays inside
+    the verified text-only compatibility surface. Validation happens before
+    OpenAI-to-Anthropic conversion so fields such as ``response_format`` and
+    ``logprobs`` cannot disappear and look as though they were honoured.
+    """
+    client_type, _ = split_client_type(body.get("model", DEFAULT_MODEL))
+    if client_type != "sand":
+        return None
+
+    if body.get("tools"):
+        return "Sand text mode does not support caller-owned tools or function calling"
+
+    feature = _message_feature(body, openai=openai)
+    if feature:
+        return "Sand text mode does not support %s" % feature
+
+    if openai:
+        response_format = body.get("response_format")
+        if response_format and not (
+                isinstance(response_format, dict) and
+                response_format.get("type") in (None, "text")):
+            return "Sand text mode does not support response_format or JSON schema output"
+        if body.get("n", 1) not in (None, 1):
+            return "Sand text mode supports exactly one choice (n=1)"
+        if body.get("logprobs") or body.get("top_logprobs") is not None:
+            return "Sand text mode does not provide logprobs"
+        modalities = body.get("modalities")
+        if modalities and modalities not in (["text"], ("text",)):
+            return "Sand text mode supports text output only"
+        if body.get("audio"):
+            return "Sand text mode does not support audio output"
+        if (body.get("thinking") or body.get("reasoning") or
+                body.get("reasoning_effort") not in (None, "", "none")):
+            return "Sand text mode does not expose thinking or reasoning blocks"
+    else:
+        thinking = body.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            return "Sand text mode does not expose thinking blocks"
+        output_config = body.get("output_config")
+        if isinstance(output_config, dict) and output_config.get("format"):
+            return "Sand text mode does not support structured output"
+
+    return None
+
+
 # Reasoning levels, weakest to strongest. Callers spell them in several ways and
 # each model family publishes its own subset, so a request is clamped onto the
 # nearest level the target model actually declares rather than sent verbatim
@@ -390,9 +488,10 @@ class Turn:
             sysmsg = ((sysmsg + "\n\n") if sysmsg else "") + CHAT_PROMPT
         self.sent_chars = (len(prompt) + len(sysmsg or "")
                            + (len(json.dumps(self.tools, ensure_ascii=False)) if self.tools else 0))
-        self.session = Session(model=self.model, system=sysmsg, tools=self.tools,
-                               web=WEB, model_params=self.model_params, debug=DEBUG,
-                               chat=self.chat, client_type=self.client_type)
+        session_type = GrokBotSession if self.client_type == "sand" else Session
+        self.session = session_type(model=self.model, system=sysmsg, tools=self.tools,
+                                    web=WEB, model_params=self.model_params, debug=DEBUG,
+                                    chat=self.chat, client_type=self.client_type)
         self.session.start(prompt, images=images, documents=docs)
 
     def resume(self, claimed):
@@ -518,6 +617,9 @@ def upstream_error(msg):
             "retention policy) in the Cursor dashboard")
     if "MODEL_NOT_AVAILABLE" in m or "MODEL_NOT_SUPPORTED" in m:
         return 400, "invalid_request_error", "model not available for the account"
+    if "unsupported_feature" in m:
+        detail = m.split("unsupported_feature:", 1)[-1].strip() or m
+        return 400, "invalid_request_error", detail
     if "permission_denied" in m or "not allowed" in m:
         return 403, "permission_error", m
     return 502, "api_error", m
@@ -759,11 +861,16 @@ class Handler(BaseHTTPRequestHandler):
         if route != "/v1/messages" and not openai:
             return self._err(404, "not_found_error", "unknown route")
 
+        if not body.get("messages"):
+            return self._err(400, "invalid_request_error", "messages: required")
+
+        unsupported = sand_request_error(body, openai=openai)
+        if unsupported:
+            return self._err(400, "invalid_request_error", unsupported)
+
         if openai:
             model_in = body.get("model", DEFAULT_MODEL)
             body = openai_api.to_anthropic(body)
-        if not body.get("messages"):
-            return self._err(400, "invalid_request_error", "messages: required")
 
         turn = Turn(body)
         started = time.time()

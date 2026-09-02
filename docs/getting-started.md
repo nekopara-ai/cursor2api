@@ -204,5 +204,5 @@ python -m cursor2api chat 'Solve 17 * 23.' \
   timeout, model-cache, or sandbox settings.
 - Read [API reference](api-reference.md) before connecting an existing SDK.
 - Read [Operations](operations.md) before running the process unattended.
-- Read [Experimental client identity routing](usage-pools.md) before using a
+- Read [Client routing and Sand / Grok Bot mode](usage-pools.md) before using a
   model prefix such as `sand/`.

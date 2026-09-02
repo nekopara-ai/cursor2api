@@ -53,7 +53,10 @@ issue.
 - arbitrary code execution in the local process;
 - unsafe handling of proxy authentication;
 - an endpoint override that leaks credentials contrary to documented behavior;
-- cross-request access to another caller's parked tool session; or
+- cross-request access to another caller's parked tool session;
+- cross-request access to a Sand transcript or temporary Agent;
+- failure to delete a Sand Agent on handled error or cancellation paths;
+- disclosure of Sand gateway, network, or Agent tokens; or
 - sensitive request content written to logs contrary to the documented logging
   contract.
 
@@ -84,7 +87,9 @@ controls are added externally:
 - GET routes, `/login`, and HEAD probes are not locally authenticated;
 - `/health` is liveness, not upstream readiness;
 - `API_KEY` is one shared secret, not user or tenant isolation;
-- live tool-session state is process-local; and
+- live tool-session state is process-local;
+- Sand requests create upstream temporary Agents and receive ephemeral gateway
+  credentials; and
 - `sandbox.py` is a compatibility layer, not an operating-system sandbox.
 
 Keep `BIND=127.0.0.1`, set `API_KEY`, and use a separately enforced reverse proxy,
@@ -113,6 +118,12 @@ Environment variables can be visible to process supervisors, crash reporters,
 administrators, and local inspection tools. Apply normal secret-management and
 least-privilege practices. Endpoint override variables can direct authentication
 requests to another host; use them only in controlled tests with a trusted target.
+
+Sand allocation returns ephemeral gateway, network, and Agent tokens. The
+implementation keeps them in memory, validates that the gateway uses HTTPS on
+`.cursorvm.com`, and must not include them in logs or errors.
+`CURSOR_GROKBOT_URL` is a protocol test override: changing it can send the
+authorization bearer to another host, so never set it to an untrusted endpoint.
 
 ## If a secret is exposed
 

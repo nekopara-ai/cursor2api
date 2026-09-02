@@ -12,12 +12,14 @@ bundle and must be treated as version-sensitive.
 
 ## Scope
 
-The proxy currently depends on three upstream surfaces:
+The proxy currently depends on five upstream surfaces across two backends:
 
 | Surface | Role |
 |---|---|
-| `agent.v1.AgentService/Run` | Bidirectional model and tool stream |
-| `aiserver.v1.AiService/AvailableModels` | Account model catalog |
+| `agent.v1.AgentService/Run` | Regular Cursor bidirectional model and tool stream |
+| `aiserver.v1.AiService/AvailableModels` | Regular account model catalog |
+| `agent.v1.GrokBotService/EnsureSandBox` | Sand gateway allocation |
+| Sand gateway `/health` and `/api/*` endpoints | Temporary text-agent lifecycle |
 | Cursor auth endpoints | API-key exchange and browser-login polling |
 
 The agent host is fixed in `cursor2api/session.py`. Authentication and catalog
@@ -39,12 +41,11 @@ authorization: Bearer <Cursor access token>
 connect-protocol-version: 1
 connect-accept-encoding: gzip
 user-agent: connect-es/1.6.1
-x-cursor-client-type: cli | sand
+x-cursor-client-type: cli
 x-cursor-client-version: cli-<compatible build id>
 x-ghost-mode: false
 x-request-id: <uuid>
 x-original-request-id: <same uuid>
-x-sand-box-namespace: prod          # when client type is sand
 x-cursor-agent-allowed-tools: ...  # caller-owned tool mode
 ```
 
@@ -52,6 +53,48 @@ x-cursor-agent-allowed-tools: ...  # caller-owned tool mode
 from a different product, even when paired with that product's client type, can
 be rejected. Misleading upstream error codes are possible when the value is stale
 or incompatible.
+
+## Sand v2 gateway
+
+The Sand route uses a separate service rather than changing the regular
+`AgentService/Run` client-type header. The observed compatibility context is
+`CURSOR_DESKTOP_VERSION=3.18.9`; like the CLI version above, it is
+version-sensitive and must be revalidated before changing it.
+
+The first step is a Connect+JSON request to:
+
+```text
+POST https://agentn.global.api5.cursor.sh/agent.v1.GrokBotService/EnsureSandBox
+content-type: application/connect+json
+connect-protocol-version: 1
+```
+
+The response supplies a `gateway_url`, `gateway_token`, and
+`network_token`. The implementation accepts only HTTPS gateways whose hostname
+is `.cursorvm.com` or a subdomain of it. These credentials are ephemeral and
+must remain in memory.
+
+The allocated gateway exposes the observed lifecycle:
+
+```text
+GET  /health
+POST /api/createAgent
+POST /api/sendPrompt
+POST /api/promptAcceptanceStatus
+POST /api/getAgentTranscript
+POST /api/deleteAgent
+```
+
+`sendPrompt` carries a plain prompt, a request nonce, and an empty attachment
+list. The observed schema has no requested-model field, tool definitions, tool
+results, or structured-output contract. Transcript entries expose plain
+user/assistant messages. Current compatibility evidence therefore covers
+text-only prompts and text transcripts, not the regular Cursor tool protocol.
+
+The nonce provides idempotency. After an ambiguous send failure, check
+`promptAcceptanceStatus` before retrying with the same nonce. Every successful
+`createAgent` must be paired with `deleteAgent` in cleanup, including request
+failure and cancellation paths.
 
 ## Connect framing
 
@@ -330,11 +373,13 @@ blocks; the OpenAI facade renders readable text lines.
 There is no equivalent Anthropic encrypted-content value or complete citation
 object in the observed stream, so those fields cannot be reconstructed.
 
-## Client identity
+## Client routing
 
-The `x-cursor-client-type` header is distinct from the CLI-version header and can
-be overridden per request through model prefixes. This path is experimental and
-is documented separately in [Experimental client identity routing](usage-pools.md).
+The `cli/` prefix uses the regular `AgentService/Run` transport. The
+`sand/`, `bot/`, and `grokbot/` prefixes use the separate Sand gateway
+lifecycle above; they are not implemented by changing a header on the regular
+stream. See [Client routing and Sand / Grok Bot mode](usage-pools.md).
 
-Do not infer billing, eligibility, or product entitlement from the header alone.
-Those are upstream account decisions outside this project's contract.
+Do not infer billing, eligibility, exact model selection, or product entitlement
+from a route label. Those are upstream account decisions outside this project's
+contract.

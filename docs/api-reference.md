@@ -40,11 +40,38 @@ No other vendor endpoints are implemented. In particular, the server does not
 provide the OpenAI Responses, legacy Completions, Embeddings, Images, Audio, or
 Assistants APIs, or Anthropic administrative/batch APIs.
 
+## Backend selection and Sand mode
+
+Bare model names and the `cli/` prefix use the regular bidirectional
+`AgentService/Run` backend. The `sand/`, `bot/`, and `grokbot/` prefixes
+use a separate Sand / Grok Bot adapter backed by a temporary Agent in Cursor's
+in-box gateway.
+
+Sand mode preserves the downstream text response envelopes, but its verified
+surface is deliberately smaller:
+
+| Sand request feature | Behavior |
+|---|---|
+| Streaming or buffered text | Supported |
+| System text and text-only history | Serialized into the prompt |
+| Stop sequences and output limits | Applied locally and approximately |
+| Usage | Estimated from request/output size |
+| Caller tools, function calling, tool history, or tool results | Rejected with `400 invalid_request_error` |
+| Images, documents, PDFs, files, or audio | Rejected with `400 invalid_request_error` |
+| JSON Schema, structured output, or non-text modalities | Rejected with `400 invalid_request_error` |
+| `n != 1`, logprobs, thinking, or reasoning blocks | Rejected with `400 invalid_request_error` |
+| Model selection after the prefix | Not available in the upstream `sendPrompt` request |
+
+The Sand gateway transcript exposes plain assistant text, not standard structured
+tool events. Sand's own internal tools cannot be converted into caller-visible
+`tool_use` or `tool_calls` events. Clients that require tool-result round trips
+must use the regular route.
+
 ## Anthropic-style Messages
 
 ### `POST /v1/messages`
 
-Commonly supported inputs include:
+On the regular route, commonly supported inputs include:
 
 - `model`;
 - `messages` with `user` and `assistant` roles;
@@ -60,7 +87,9 @@ Commonly supported inputs include:
 
 `messages` must be present and non-empty. Validation is intentionally limited;
 malformed nested structures may surface as a generic 4xx, 5xx, or upstream error
-rather than a field-by-field vendor-compatible validation response.
+rather than a field-by-field vendor-compatible validation response. Sand-prefixed
+requests are checked against the smaller text-only surface before conversion or
+Agent creation.
 
 #### Message history
 
@@ -162,7 +191,7 @@ Anthropic's token-counting API.
 
 ### Request conversion
 
-The OpenAI-style handler converts the following common structures:
+On the regular route, the OpenAI-style handler converts the following common structures:
 
 | OpenAI input | Internal conversion |
 |---|---|
@@ -230,6 +259,10 @@ Resolution can recognize:
 - selected Anthropic, OpenAI, Gemini, Grok, and Kimi aliases; and
 - experimental client prefixes described in [usage-pools.md](usage-pools.md).
 
+For Sand-prefixed requests, the text after the prefix remains visible in the
+downstream model field but is not sent as a selectable model to the gateway.
+It is therefore a routing/response label rather than proof of the actual backend.
+
 Resolution is permissive. Some vendor-family aliases use prefix matching, and an
 unknown ID ultimately falls back to `DEFAULT_MODEL`. Clients that require strict
 model validation should compare against `/v1/models` before sending a request.
@@ -245,7 +278,9 @@ Usage is not always an upstream per-request counter:
 - cache-read and cache-creation counters are bounded so they do not exceed the
   reported input total; and
 - OpenAI `prompt_tokens`, `completion_tokens`, and `total_tokens` are derived from
-  those normalized values.
+  those normalized values; and
+- Sand turns do not expose an exact per-request counter, so their usage is
+  estimated from serialized prompt and emitted text size.
 
 Treat the fields as operational estimates, not billing-authoritative data.
 
@@ -264,7 +299,9 @@ control. This includes, but is not limited to:
 - arbitrary metadata.
 
 Acceptance means the request can proceed; it does not mean the requested behavior
-is implemented.
+is implemented. This paragraph describes the regular route. Sand mode rejects
+fields that would materially change the response shape instead of silently
+accepting them; see [Backend selection and Sand mode](#backend-selection-and-sand-mode).
 
 ## Errors
 
@@ -291,6 +328,7 @@ Common mappings include:
 | Cursor credential rejection | `401` | `authentication_error` |
 | Account/model permission rejection | `403` | `permission_error` |
 | Model not available for account | `400` | `invalid_request_error` |
+| Unsupported Sand capability | `400` | `invalid_request_error` |
 | Other upstream or transport failure | `502` | `api_error` |
 | Unhandled local exception | `500` | `api_error` |
 

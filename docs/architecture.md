@@ -2,7 +2,7 @@
 
 `cursor2api` is a protocol translation process, not a model host. It accepts local
 HTTP requests, derives a Cursor access token, translates request content into a
-private Cursor agent stream, and converts streamed events back into Anthropic- or
+one of two private Cursor backends, and converts events back into Anthropic- or
 OpenAI-shaped responses.
 
 ```text
@@ -12,19 +12,15 @@ Anthropic/OpenAI client
         v
 cursor2api.server
         |-- request normalization and response rendering
-        |-- model resolution and usage normalization
-        |-- parked live tool sessions
+        |-- model/client-prefix routing and usage normalization
         |
-        v
-cursor2api.session
-        |-- agent request and protobuf message construction
-        |-- caller tool routing and builtin compatibility replies
-        |
-        v
-cursor2api.h2stream
-        |-- TLS + ALPN h2
-        |-- bidirectional Connect stream
-        |-- optional HTTP CONNECT proxy
+        | regular / cli                       | sand / bot / grokbot
+        v                                     v
+cursor2api.session                    cursor2api.grokbot
+        |-- protobuf + caller tools           |-- EnsureSandBox
+        v                                     |-- temporary Agent + transcript
+cursor2api.h2stream                            v
+        |-- bidirectional Connect      Cursor in-box Sand gateway
         v
 Cursor agent endpoint
 ```
@@ -33,7 +29,8 @@ Cursor agent endpoint
 
 | Module | Responsibility |
 |---|---|
-| `cursor2api/server.py` | HTTP routes, local API-key gate, Anthropic response shapes, OpenAI facade dispatch, live-session registry, usage normalization, turn logs |
+| `cursor2api/server.py` | HTTP routes, local API-key gate, backend selection, Anthropic response shapes, OpenAI facade dispatch, live-session registry, usage normalization, turn logs |
+| `cursor2api/grokbot.py` | Sand control-plane and in-box gateway client, temporary Agent lifecycle, transcript-to-text events |
 | `cursor2api/openai_api.py` | OpenAI Chat Completions request and response conversion |
 | `cursor2api/session.py` | Cursor Run request construction, protobuf field handling, upstream event decoding, tools, attachments, client identity |
 | `cursor2api/h2stream.py` | Raw TLS/HTTP/2 transport, flow control, connection prewarming, CONNECT proxy support |
@@ -50,26 +47,40 @@ Cursor agent endpoint
 2. The body is parsed using `Content-Length` and normalized to the project's
    Anthropic-style internal shape. OpenAI chat requests pass through
    `openai_api.to_anthropic()`.
-3. `Turn` separates an optional client-identity prefix from the model string and
-   asks `models.resolve()` for an upstream model plus parameters.
-4. The request's message history is flattened. Attachments in the final message
-   remain binary context; previous attachments become transcript placeholders.
-5. If the final message is exactly a complete set of matching tool results, the
-   server attempts to claim a parked live session. Otherwise `Session.start()`
-   opens a new upstream stream.
-6. `auth.access_token()` selects or derives a usable Cursor bearer token.
-7. `h2stream.acquire()` obtains a pre-warmed connection or establishes TLS with
-   ALPN `h2`. `Session` starts the bidirectional Connect RPC and sends framed
-   protobuf messages without half-closing the request side.
-8. Upstream interaction and exec messages are decoded into normalized events:
-   text, thinking summaries, web results, tool calls, usage, terminal state, or
-   errors.
-9. `server.py` renders those events as either buffered JSON or HTTP/1.1 chunked
-   SSE in the API flavor selected by the route.
-10. A tool-call turn can leave the upstream stream parked. Other terminal paths
-    close the session.
+3. `Turn` separates an optional client prefix from the model string and asks
+   `models.resolve()` for regular-route model metadata.
+4. Sand-selected requests are checked against the text-only capability surface.
+   Regular requests continue through message, attachment, and tool normalization.
+5. `auth.access_token()` selects or derives a usable Cursor bearer token.
+6. On the regular route, matching tool results may claim a parked `Session`;
+   otherwise `Session.start()` opens the bidirectional HTTP/2 stream.
+7. On the Sand route, `GrokBotSession` ensures the account sandbox, creates a
+   temporary Agent, sends one serialized text prompt, and polls transcript and
+   health snapshots.
+8. Each backend yields normalized events within the surface it supports.
+9. `server.py` renders those events as buffered JSON or HTTP/1.1 chunked SSE.
+10. Regular tool-call turns may remain parked. Sand terminal paths attempt to
+    delete the temporary Agent.
 
-## Why the transport is custom
+## Sand backend lifecycle
+
+The Sand path does not reuse the regular `AgentService/Run` stream. It calls the
+account control plane for an HTTPS gateway descriptor, validates the gateway host,
+then uses JSON endpoints inside the account's box:
+
+1. ensure the SandBox and wait for gateway health;
+2. create one temporary Agent;
+3. serialize system text and text history into one prompt;
+4. send with a unique idempotency nonce;
+5. poll transcript snapshots and convert append-only text into deltas; and
+6. delete the Agent during cleanup.
+
+The gateway does not accept a model field, caller tool schema, tool result, or
+attachment upload in this implementation. The HTTP layer therefore rejects those
+request shapes before Agent creation. Abrupt process termination can prevent
+best-effort cleanup, so inspect the account's Agent list after abnormal shutdowns.
+
+## Why the regular transport is custom
 
 The upstream Run operation is genuinely bidirectional. It can request context,
 conversation-state operations, builtin tool results, and MCP tool results while
@@ -122,6 +133,9 @@ that model. Some families expose `effort`; others expose `reasoning`; models tha
 publish neither do not receive an invented parameter.
 
 ## Tools and ownership
+
+The following tool behavior applies only to the regular backend. Sand mode does
+not expose caller-owned tool round trips.
 
 With the default `CURSOR2API_TOOL_OWNER=caller`:
 

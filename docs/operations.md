@@ -182,6 +182,30 @@ Live tool sessions are stored only in process memory and expire after
 If a client waits longer than the TTL before returning results, replay is expected
 and not necessarily an error.
 
+## Sand gateway operation
+
+The local `/health` endpoint does not allocate or test a Sand gateway. A Sand
+request performs `EnsureSandBox`, creates a temporary Agent, sends one prompt,
+polls acceptance and transcript state, and deletes the Agent in cleanup.
+
+Operational consequences:
+
+- unsupported features are rejected with HTTP 400 before an Agent is created;
+- an abrupt process or host failure can interrupt cleanup and leave a temporary
+  Agent upstream, so inspect the account's Agent list after abnormal shutdown;
+- gateway, network, and Agent tokens are ephemeral secrets and must not be logged
+  or persisted;
+- Sand uses the standard library HTTP client and its normal
+  `https_proxy`/`HTTPS_PROXY` behavior; `CURSOR2API_PROXY` configures the
+  regular HTTP/2 transport only;
+- failures before response streaming use the mapped HTTP error status, while
+  failures after SSE headers are committed appear as terminal error events; and
+- a successful text probe confirms only the text transcript path, not tools,
+  attachments, exact model selection, or structured output.
+
+For a cleanup-sensitive probe, compare the visible Agent set before and after the
+request and allow for normal upstream deletion propagation.
+
 ## Proxy operation
 
 Set `CURSOR2API_PROXY`, `https_proxy`, or `HTTPS_PROXY` to use an HTTP CONNECT
@@ -253,7 +277,9 @@ Because compatibility depends on private upstream behavior:
 3. run the complete offline suite;
 4. start the candidate on a separate local port;
 5. verify liveness, credentials, model catalog, one text request, one streaming
-   request, and any tool/image paths your deployment depends on;
+   request, and any tool/image paths your deployment depends on; if Sand is used,
+   also run a Sand text probe and confirm the temporary Agent set returns to its
+   pre-test state;
 6. activate the candidate through the existing supervisor or service manager;
 7. verify the new process identity and a real request; and
 8. retain a rollback path to the previous commit.

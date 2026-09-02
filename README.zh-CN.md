@@ -10,6 +10,13 @@ Anthropic Messages API 和 OpenAI Chat Completions API 的常见接口形式。
 > 以及任何模型提供方均无隶属或背书关系。项目依赖私有、未公开、对版本敏感的
 > 上游协议，可能随时失效。使用前请自行确认账号所适用的服务条款。
 
+> [!IMPORTANT]
+> 本仓库采用 MIT License，属于完全开源项目：在许可证条款下允许使用、修改、再分发
+> 和商业使用。如果项目对你有帮助，请
+> [在 GitHub 点一个 Star](https://github.com/nekopara-ai/cursor2api)。
+> Star 是维护者强烈请求的支持方式，不是额外的许可条件；程序不会验证 Star，也不会
+> 收集 GitHub 凭据。
+
 本项目面向本地开发、互操作实验和协议研究。它不是任一厂商 API 的完整替代实现，
 也不适合作为公网或多租户服务运行。
 
@@ -22,7 +29,8 @@ Anthropic Messages API 和 OpenAI Chat Completions API 的常见接口形式。
 - Cursor API key 兑换、浏览器登录，以及可选复用 Cursor CLI 凭据。
 - 面向 Cursor agent 流的双向 HTTP/2 传输，并支持可选的 HTTP CONNECT 出站。
 - 在及时返回完整匹配的工具结果集合时，续接仍存活的工具调用会话。
-- 通过模型名前缀进行实验性的逐请求客户端身份路由。
+- 通过模型名前缀在普通 Agent 流与能力更窄的纯文本 Sand / Grok Bot
+  网关之间逐请求路由。
 
 ## 能力边界
 
@@ -34,7 +42,8 @@ Anthropic Messages API 和 OpenAI Chat Completions API 的常见接口形式。
 | Token 计数与 usage | 本地近似 | Cursor 并非在每个工具轮次都提供等价的单请求计数，因此部分结果会被估算或钳制。 |
 | 采样和响应控制 | 接受但无等价行为 | `temperature`、`top_p`、`seed`、penalties、`n`、`response_format` 等参数没有对应的上游控制。 |
 | 模型别名 | 尽力解析 | 未知模型名会回退到 `DEFAULT_MODEL`，而不是返回参数校验错误。 |
-| 客户端身份前缀 | 实验性 | `sand/`、`bot/`、`grokbot/`、`cli/` 会改变声明的客户端类型，上游不保证长期接受。 |
+| Sand / Grok Bot 前缀 | 纯文本子集 | `sand/`、`bot/`、`grokbot/` 走单独的临时 Agent 网关；工具、附件、结构化输出、多 choice、logprobs 和 reasoning block 会被明确拒绝。 |
+| 普通客户端前缀 | 实验性 | `cli/` 保持普通双向 AgentService 路径，上游不保证长期接受。 |
 | 上游协议 | 不稳定 | 字段号、必需请求头和行为都可能随 Cursor 版本变化。 |
 
 准确的请求与响应行为见 [API 参考](docs/api-reference.md)。
@@ -113,6 +122,47 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 请把示例模型替换为 `/v1/models` 返回的 ID。模型目录请求成功，不代表具体模型调用
 一定已获授权；当上游目录请求失败时，该端点还可能返回内置的 fallback 目录。
 
+## Sand / Grok Bot 模式
+
+在模型名前加 `sand/`（别名：`bot/`、`grokbot/`），即可通过新版 Box 内网关
+使用账号的 Sand / Grok Bot 路径：
+
+```bash
+curl http://127.0.0.1:8787/v1/messages \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: local-development-key' \
+  -d '{
+    "model": "sand/claude-fable-5",
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "你好，Sand"}]
+  }'
+```
+
+Sand 模式保留现有 Anthropic/OpenAI 的文本响应结构，但它是**纯文本 API 兼容，
+不是完整 Cursor API 或厂商 API 等价实现**。正常请求会创建一个临时 Sand Agent，
+监听其纯文本 transcript、增量输出文本，并在清理阶段删除 Agent。
+
+| Sand 模式能力 | 状态 |
+|---|---|
+| 流式与非流式文本 | 支持 |
+| system 提示与纯文本多轮历史 | 通过 prompt 序列化支持 |
+| stop 与输出长度限制 | 本地近似 |
+| usage 字段 | 估算值，不是账单权威数据 |
+| 调用方工具 / OpenAI function calling | 不支持，返回 `400 invalid_request_error` |
+| 结构化工具历史和 tool result | 不支持，返回 `400` |
+| 图片、PDF、文件、音频 | 不支持，返回 `400` |
+| JSON Schema、结构化输出、非文本 modality | 不支持，返回 `400` |
+| `n != 1`、logprobs、thinking、reasoning block | 不支持，返回 `400` |
+| 前缀后的精确模型选择 | 不可用 |
+
+`sand/` 后的文本只作为客户端路由和响应标签保留。Sand 的 `sendPrompt` 请求没有
+模型选择字段，所以 `sand/claude-fable-5` 不保证实际后端或 reasoning 设置。
+Sand 自己的内部工具不会以标准 `tool_use` 或 `tool_calls` 事件暴露，因此依赖
+调用方工具结果往返的 Claude Code、Codex 和 Agent 框架不能使用这个模式。
+
+准确边界见 [API 参考](docs/api-reference.md)和
+[客户端路由](docs/usage-pools.md)。
+
 ## 文档导航
 
 | 文档 | 内容 |
@@ -123,7 +173,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 | [架构](docs/architecture.md) | 组件、请求流程、工具调用、活会话和信任边界 |
 | [运维](docs/operations.md) | 部署边界、健康检查、日志、超时与故障排查 |
 | [协议笔记](docs/protocol.md) | 对版本敏感的 Connect/protobuf 传输说明 |
-| [实验性客户端身份路由](docs/usage-pools.md) | `cli`、`sand` 路由行为和风险 |
+| [客户端路由与 Sand / Grok Bot 模式](docs/usage-pools.md) | `cli`、`sand` 路由行为和风险 |
 | [贡献指南](CONTRIBUTING.md) | 开发流程和 Pull Request 要求 |
 | [安全策略](SECURITY.md) | 私密报告方式和部署安全建议 |
 
@@ -156,5 +206,10 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python tests/test_timeouts_offline.py
 
 ## 许可与商标
 
-代码采用 [MIT License](LICENSE)。Cursor、Anthropic、OpenAI、xAI 及相关产品名
-属于各自权利人，本项目仅用它们标识互操作目标。
+代码采用 [MIT License](LICENSE)，在该许可证下允许使用、修改、再分发、再许可和
+销售。如果你使用本项目或从中受益，维护者强烈请求你
+[给仓库点一个 Star](https://github.com/nekopara-ai/cursor2api)；这一支持请求不是
+额外的许可限制。
+
+Cursor、Anthropic、OpenAI、xAI 及相关产品名属于各自权利人，本项目仅用它们标识
+互操作目标。
